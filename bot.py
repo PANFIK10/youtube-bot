@@ -2,7 +2,7 @@ import asyncio
 import logging
 import os
 import math
-import sqlite3
+import psycopg2
 import random
 from datetime import datetime
 from aiogram import Bot, Dispatcher, types, F
@@ -17,9 +17,18 @@ from aiogram.exceptions import TelegramBadRequest
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
+# Настройки БД PostgreSQL
+DB_HOST = os.getenv("DB_HOST")
+DB_NAME = os.getenv("DB_NAME")
+DB_USER = os.getenv("DB_USER")
+DB_PASS = os.getenv("DB_PASS")
+DB_PORT = os.getenv("DB_PORT", "5432")
+
+# Клиент OpenRouter (с таймаутом 120 секунд, чтобы не висел вечно)
 client = AsyncOpenAI(
     base_url="https://openrouter.ai/api/v1",
     api_key=OPENROUTER_API_KEY,
+    timeout=120.0 
 )
 
 bot = Bot(token=TELEGRAM_TOKEN)
@@ -27,8 +36,6 @@ dp = Dispatcher()
 logging.basicConfig(level=logging.INFO)
 
 WORDS_PER_MINUTE = 130
-
-# --- СЛОВАРЬ ИМЕН ---
 MODEL_NAMES = {
     "anthropic/claude-haiku-4.5": "Claude",
     "openai/gpt-5.1": "ChatGPT",
@@ -37,84 +44,93 @@ MODEL_NAMES = {
     "qwen/qwen3.5-flash-02-23": "Qwen"
 }
 
-# --- БАЗА ДАННЫХ ---
+# --- РАБОТА С PostgreSQL ---
+def get_db_connection():
+    return psycopg2.connect(
+        host=DB_HOST, database=DB_NAME,
+        user=DB_USER, password=DB_PASS, port=DB_PORT
+    )
+
 def init_db():
-    conn = sqlite3.connect('templates.db')
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS templates (name TEXT PRIMARY KEY, prompt TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS settings (user_id INTEGER PRIMARY KEY, model_name TEXT)''')
-    # Новая таблица для логов задач
+    c.execute('''CREATE TABLE IF NOT EXISTS settings (user_id BIGINT PRIMARY KEY, model_name TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS tasks (
-                    task_id TEXT PRIMARY KEY, 
-                    user_id INTEGER, 
-                    topic TEXT, 
-                    model TEXT, 
-                    status TEXT, 
-                    created_at TEXT)''')
+                    task_id TEXT PRIMARY KEY, user_id BIGINT, 
+                    topic TEXT, model TEXT, status TEXT, created_at TEXT)''')
     
     c.execute("SELECT COUNT(*) FROM templates")
     if c.fetchone()[0] == 0:
-        c.execute("INSERT INTO templates (name, prompt) VALUES (?, ?)", 
+        c.execute("INSERT INTO templates (name, prompt) VALUES (%s, %s)", 
                   ("🎬 Стандартный", "Напиши увлекательный сценарий для YouTube."))
     conn.commit()
+    c.close()
     conn.close()
 
 def log_task(task_id, user_id, topic, model):
-    conn = sqlite3.connect('templates.db')
+    conn = get_db_connection()
     c = conn.cursor()
     now = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
-    c.execute("INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?)", 
+    c.execute("INSERT INTO tasks VALUES (%s, %s, %s, %s, %s, %s)", 
               (task_id, user_id, topic, model, "In Progress", now))
     conn.commit()
+    c.close()
     conn.close()
 
 def update_task_status(task_id, status):
-    conn = sqlite3.connect('templates.db')
+    conn = get_db_connection()
     c = conn.cursor()
-    c.execute("UPDATE tasks SET status = ? WHERE task_id = ?", (status, task_id))
+    c.execute("UPDATE tasks SET status = %s WHERE task_id = %s", (status, task_id))
     conn.commit()
+    c.close()
     conn.close()
 
 def get_user_model(user_id):
-    conn = sqlite3.connect('templates.db')
+    conn = get_db_connection()
     c = conn.cursor()
-    c.execute("SELECT model_name FROM settings WHERE user_id = ?", (user_id,))
+    c.execute("SELECT model_name FROM settings WHERE user_id = %s", (user_id,))
     row = c.fetchone()
+    c.close()
     conn.close()
     return row[0] if row else "x-ai/grok-4.1-fast"
 
 def set_user_model(user_id, model_name):
-    conn = sqlite3.connect('templates.db')
+    conn = get_db_connection()
     c = conn.cursor()
-    c.execute("REPLACE INTO settings (user_id, model_name) VALUES (?, ?)", (user_id, model_name))
+    c.execute("INSERT INTO settings (user_id, model_name) VALUES (%s, %s) ON CONFLICT (user_id) DO UPDATE SET model_name = EXCLUDED.model_name", (user_id, model_name))
     conn.commit()
+    c.close()
     conn.close()
 
 def get_templates():
-    conn = sqlite3.connect('templates.db')
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute("SELECT name, prompt FROM templates")
     res = {row[0]: row[1] for row in c.fetchall()}
+    c.close()
     conn.close()
     return res
 
 def add_template(name, prompt):
-    conn = sqlite3.connect('templates.db')
+    conn = get_db_connection()
     c = conn.cursor()
-    c.execute("REPLACE INTO templates (name, prompt) VALUES (?, ?)", (name, prompt))
+    c.execute("INSERT INTO templates (name, prompt) VALUES (%s, %s) ON CONFLICT (name) DO UPDATE SET prompt = EXCLUDED.prompt", (name, prompt))
     conn.commit()
+    c.close()
     conn.close()
 
 def delete_template(name):
-    conn = sqlite3.connect('templates.db')
+    conn = get_db_connection()
     c = conn.cursor()
-    c.execute("DELETE FROM templates WHERE name = ?", (name,))
+    c.execute("DELETE FROM templates WHERE name = %s", (name,))
     conn.commit()
+    c.close()
     conn.close()
 
 init_db()
 
-# --- FSM ---
+# --- СОСТОЯНИЯ ---
 class ScriptMaker(StatesGroup):
     waiting_for_topic = State()
     waiting_for_duration = State()
@@ -156,7 +172,12 @@ def get_dynamic_templates_kb():
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message, state: FSMContext):
     await state.clear()
-    await message.answer("Бот-сценарист СССР готов! Выбирай действие:", reply_markup=get_main_kb())
+    welcome_text = (
+        "👋 **Добро пожаловать в генератор сценариев!**\n\n"
+        "Создавайте готовые сценарии без борьбы с лимитами и склеек.\n\n"
+        "🎭 **Claude** — стиль.\n🧠 **ChatGPT** — логика.\n⚡ **Gemini** — память.\n🔥 **Grok** — дерзость.\n🐲 **Qwen** — скорость."
+    )
+    await message.answer(welcome_text, reply_markup=get_main_kb(), parse_mode="Markdown")
 
 @dp.message(F.text == "🔙 Назад в меню")
 async def back_to_main(message: types.Message, state: FSMContext):
@@ -167,17 +188,8 @@ async def back_to_main(message: types.Message, state: FSMContext):
 async def settings_menu(message: types.Message):
     current_id = get_user_model(message.from_user.id)
     friendly = MODEL_NAMES.get(current_id, current_id)
-    info = (
-        "⚙️ **Настройки интеллекта**\n\n"
-        f"Текущая модель: **{friendly}**\n\n"
-        "📜 **Доступные варианты:**\n"
-        "• **Claude** — Стиль и живой язык.\n"
-        "• **ChatGPT** — Логика и точность.\n"
-        "• **Gemini** — Огромная память.\n"
-        "• **Grok** — 🚀 Дерзкие сценарии.\n"
-        "• **Qwen** — Скорость и дисциплина.\n"
-    )
-    await message.answer(info, reply_markup=get_models_kb(), parse_mode="Markdown")
+    await message.answer(f"⚙️ **Настройки интеллекта**\n\nТекущая модель: **{friendly}**", 
+                         reply_markup=get_models_kb(), parse_mode="Markdown")
 
 @dp.message(F.text.in_(MODEL_NAMES.values()))
 async def change_model(message: types.Message):
@@ -186,7 +198,7 @@ async def change_model(message: types.Message):
     set_user_model(message.from_user.id, selected_id)
     await message.answer(f"✅ Модель изменена на: **{message.text}**", reply_markup=get_main_kb())
 
-# --- ШАБЛОНЫ ---
+# --- УПРАВЛЕНИЕ ШАБЛОНАМИ ---
 @dp.message(F.text == "📁 Мои шаблоны")
 async def templates_menu(message: types.Message):
     templates = get_templates()
@@ -211,7 +223,7 @@ async def add_template_name(message: types.Message, state: FSMContext):
 async def add_template_prompt(message: types.Message, state: FSMContext):
     data = await state.get_data()
     add_template(data['template_name'], message.text)
-    await message.answer("✅ Сохранено!", reply_markup=get_main_kb())
+    await message.answer("✅ Сохранено в PostgreSQL!", reply_markup=get_main_kb())
     await state.clear()
 
 @dp.message(F.text == "🗑 Удалить шаблон")
@@ -256,83 +268,57 @@ async def generate_script(message: types.Message, state: FSMContext):
     style_prompt = templates[message.text]
     data = await state.get_data()
     model_id = get_user_model(message.from_user.id)
-    
-    # Исправляем отображение: берем красивое имя модели для сообщения
     friendly_model = MODEL_NAMES.get(model_id, "AI")
     
     task_id = f"{random.randint(100, 999)} {random.randint(100, 999)} {random.randint(100, 999)}"
     log_task(task_id, message.from_user.id, data['topic'], friendly_model)
 
-    # Теперь здесь пишется чистое название (Grok, Gemini и т.д.)
     status_msg = await message.answer(
-        f"⏳ **Задача создана**\n\n"
-        f"🆔 ID: `{task_id}`\n"
-        f"🤖 Модель: **{friendly_model}**\n"
-        f"📊 Статус: Подготовка структуры...",
+        f"⏳ **Задача создана**\n\n🆔 ID: `{task_id}`\n🤖 Модель: **{friendly_model}**\n📊 Статус: Подготовка структуры...",
         reply_markup=get_main_kb(), parse_mode="Markdown"
     )
 
     try:
         parts_count = math.ceil(data['words_target'] / 1000)
-        if parts_count < 1: parts_count = 1
-
+        
+        # 1. Генерируем план
         plan_prompt = f"Составь план для видео '{data['topic']}' на {parts_count} глав. Только список названий."
-        response = await client.chat.completions.create(
-            model=model_id,
-            messages=[{"role": "user", "content": plan_prompt}]
-        )
+        response = await client.chat.completions.create(model=model_id, messages=[{"role": "user", "content": plan_prompt}])
         plan_text = response.choices[0].message.content
         chapters = [c for c in plan_text.split('\n') if c.strip() and any(char.isdigit() for char in c[:3])]
         
-        # full_script теперь пустой в начале, без заголовков и планов
         full_script = ""
 
         for i, chapter in enumerate(chapters):
             try:
                 await status_msg.edit_text(
-                    f"🚀 **Генерация в процессе**\n\n"
-                    f"🆔 ID: `{task_id}`\n"
-                    f"🤖 Модель: **{friendly_model}**\n"
-                    f"✍️ Пишу часть: `{i+1} из {len(chapters)}`",
+                    f"🚀 **Генерация в процессе**\n\n🆔 ID: `{task_id}`\n🤖 Модель: **{friendly_model}**\n✍️ Пишу часть: `{i+1} из {len(chapters)}`",
                     parse_mode="Markdown"
                 )
             except Exception: pass
 
-            # Усиленный промпт, чтобы ИИ не писал заголовки глав сам
-            chapter_prompt = (
-                f"Тема видео: {data['topic']}\n"
-                f"Пиши текст ТОЛЬКО для этого раздела: {chapter}\n"
-                f"ТВОИ ПРАВИЛА: {style_prompt}\n\n"
-                f"ВАЖНО: Начни сразу с текста для озвучки. НЕ ПИШИ название главы, цифры или вступления."
-            )
-            
-            resp = await client.chat.completions.create(
-                model=model_id,
-                messages=[{"role": "user", "content": chapter_prompt}]
-            )
-            
-            # Склеиваем только чистый текст
+            chapter_prompt = f"Тема: {data['topic']}\nГлава: {chapter}\nПравила: {style_prompt}\nПиши объемно. БЕЗ ЗАГОЛОВКОВ."
+            resp = await client.chat.completions.create(model=model_id, messages=[{"role": "user", "content": chapter_prompt}])
             full_script += resp.choices[0].message.content + "\n\n"
             await asyncio.sleep(5)
 
         file_name = f"script_{task_id.replace(' ', '_')}.txt"
-        with open(file_name, "w", encoding="utf-8") as f: 
-            f.write(full_script)
+        with open(file_name, "w", encoding="utf-8") as f: f.write(full_script)
         
-        await status_msg.edit_text(f"✅ **Готово!**\n🆔 ID: `{task_id}`\n\nСценарий отправлен файлом ниже.", parse_mode="Markdown")
+        await status_msg.edit_text(f"✅ **Готово!**\n🆔 ID: `{task_id}`\n\nФайл отправлен ниже.", parse_mode="Markdown")
         await message.answer_document(FSInputFile(file_name))
-        
         update_task_status(task_id, "Completed")
         os.remove(file_name)
 
     except Exception as e:
-        await status_msg.edit_text(f"❌ **Ошибка задачи** `{task_id}`\n\nТекст ошибки: {e}")
-        update_task_status(task_id, f"Error: {e}")
+        # КРИТИЧЕСКИЙ ФИКС: Убираем Markdown, чтобы любая ошибка вывелась как простой текст
+        await status_msg.edit_text(f"❌ Ошибка задачи {task_id}\n\nТекст ошибки: {str(e)}", parse_mode=None)
+        update_task_status(task_id, f"Error: {str(e)}")
 
     await state.clear()
 
 async def main():
-    print("Бот запущен. Система тасков активна.")
+    print("Бот на PostgreSQL запущен!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
