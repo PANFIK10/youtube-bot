@@ -279,20 +279,34 @@ async def generate_script(message: types.Message, state: FSMContext):
     )
 
     try:
-        parts_count = math.ceil(data['words_target'] / 1000)
-        
-        # 1. Генерируем план
-        plan_prompt = f"Составь план для видео '{data['topic']}' на {parts_count} глав. Только список названий."
+        # 1. План
+        plan_prompt = f"Составь план для видео '{data['topic']}' на {math.ceil(data['words_target'] / 1000)} глав. Только список названий."
         response = await client.chat.completions.create(model=model_id, messages=[{"role": "user", "content": plan_prompt}])
         plan_text = response.choices[0].message.content
         chapters = [c for c in plan_text.split('\n') if c.strip() and any(char.isdigit() for char in c[:3])]
         
         full_script = ""
+        total_chapters = len(chapters)
+        
+        # --- РАСЧЕТ ВРЕМЕНИ ---
+        # Считаем, что одна глава делается ~30 секунд (генерация + пауза)
+        sec_per_chapter = 30 
 
         for i, chapter in enumerate(chapters):
+            # Считаем остаток времени
+            chapters_left = total_chapters - i
+            est_seconds = chapters_left * sec_per_chapter
+            est_min = est_seconds // 60
+            est_sec = est_seconds % 60
+            time_str = f"{est_min} мин. {est_sec} сек." if est_min > 0 else f"{est_sec} сек."
+
             try:
                 await status_msg.edit_text(
-                    f"🚀 **Генерация в процессе**\n\n🆔 ID: `{task_id}`\n🤖 Модель: **{friendly_model}**\n✍️ Пишу часть: `{i+1} из {len(chapters)}`",
+                    f"🚀 **Генерация в процессе**\n\n"
+                    f"🆔 ID: `{task_id}`\n"
+                    f"🤖 Модель: **{friendly_model}**\n"
+                    f"✍️ Пишу часть: `{i+1} из {total_chapters}`\n"
+                    f"⏱ Приблизительно осталось: `{time_str}`",
                     parse_mode="Markdown"
                 )
             except Exception: pass
@@ -300,18 +314,21 @@ async def generate_script(message: types.Message, state: FSMContext):
             chapter_prompt = f"Тема: {data['topic']}\nГлава: {chapter}\nПравила: {style_prompt}\nПиши объемно. БЕЗ ЗАГОЛОВКОВ."
             resp = await client.chat.completions.create(model=model_id, messages=[{"role": "user", "content": chapter_prompt}])
             full_script += resp.choices[0].message.content + "\n\n"
+            
+            # Ждем 5 секунд между главами для стабильности API
             await asyncio.sleep(5)
 
         file_name = f"script_{task_id.replace(' ', '_')}.txt"
         with open(file_name, "w", encoding="utf-8") as f: f.write(full_script)
         
-        await status_msg.edit_text(f"✅ **Готово!**\n🆔 ID: `{task_id}`\n\nФайл отправлен ниже.", parse_mode="Markdown")
+        await status_msg.edit_text(f"✅ **Готово!**\n🆔 ID: `{task_id}`\n\nСценарий отправлен файлом ниже.", parse_mode="Markdown")
         await message.answer_document(FSInputFile(file_name))
+        
         update_task_status(task_id, "Completed")
         os.remove(file_name)
 
     except Exception as e:
-        # КРИТИЧЕСКИЙ ФИКС: Убираем Markdown, чтобы любая ошибка вывелась как простой текст
+        # Безопасный вывод ошибки без Markdown
         await status_msg.edit_text(f"❌ Ошибка задачи {task_id}\n\nТекст ошибки: {str(e)}", parse_mode=None)
         update_task_status(task_id, f"Error: {str(e)}")
 
