@@ -16,12 +16,9 @@ from aiogram.exceptions import TelegramBadRequest
 # --- КОНФИГУРАЦИЯ ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-
-# Настройки БД PostgreSQL
-# Теперь используем одну общую ссылку
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Клиент OpenRouter (с таймаутом 120 секунд, чтобы не висел вечно)
+# Клиент OpenRouter
 client = AsyncOpenAI(
     base_url="https://openrouter.ai/api/v1",
     api_key=OPENROUTER_API_KEY,
@@ -43,10 +40,7 @@ MODEL_NAMES = {
 
 # --- РАБОТА С PostgreSQL ---
 def get_db_connection():
-    # Теперь мы просто передаем одну общую ссылку
-    # sslmode='prefer' поможет, если сервер требует защищенное соединение
     return psycopg2.connect(DATABASE_URL, sslmode='prefer')
-    
 
 def init_db():
     conn = get_db_connection()
@@ -162,7 +156,6 @@ def get_templates_menu_kb():
 def get_dynamic_templates_kb():
     templates = get_templates()
     kb = [[KeyboardButton(text=name)] for name in templates.keys()]
-    # Новая кнопка
     kb.append([KeyboardButton(text="➕ Создать новый шаблон")]) 
     kb.append([KeyboardButton(text="🔙 Назад в меню")])
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
@@ -172,11 +165,11 @@ def get_dynamic_templates_kb():
 async def start_cmd(message: types.Message, state: FSMContext):
     await state.clear()
     welcome_text = (
-        "👋 **Добро пожаловать в генератор сценариев!**\n\n"
+        "👋 <b>Добро пожаловать в генератор сценариев!</b>\n\n"
         "Создавайте готовые сценарии без борьбы с лимитами и склеек.\n\n"
-        "🎭 **Claude** — стиль.\n🧠 **ChatGPT** — логика.\n⚡ **Gemini** — память.\n🔥 **Grok** — дерзость.\n🐲 **Qwen** — скорость."
+        "🎭 <b>Claude</b> — стиль.\n🧠 <b>ChatGPT</b> — логика.\n⚡ <b>Gemini</b> — память.\n🔥 <b>Grok</b> — дерзость.\n🐲 <b>Qwen</b> — скорость."
     )
-    await message.answer(welcome_text, reply_markup=get_main_kb(), parse_mode="Markdown")
+    await message.answer(welcome_text, reply_markup=get_main_kb(), parse_mode="HTML")
 
 @dp.message(F.text == "🔙 Назад в меню")
 async def back_to_main(message: types.Message, state: FSMContext):
@@ -187,25 +180,27 @@ async def back_to_main(message: types.Message, state: FSMContext):
 async def settings_menu(message: types.Message):
     current_id = get_user_model(message.from_user.id)
     friendly = MODEL_NAMES.get(current_id, current_id)
-    await message.answer(f"⚙️ **Настройки интеллекта**\n\nТекущая модель: **{friendly}**", 
-                         reply_markup=get_models_kb(), parse_mode="Markdown")
+    await message.answer(f"⚙️ <b>Настройки интеллекта</b>\n\nТекущая модель: <b>{friendly}</b>", 
+                         reply_markup=get_models_kb(), parse_mode="HTML")
 
 @dp.message(F.text.in_(MODEL_NAMES.values()))
 async def change_model(message: types.Message):
     inv_map = {v: k for k, v in MODEL_NAMES.items()}
     selected_id = inv_map[message.text]
     set_user_model(message.from_user.id, selected_id)
-    await message.answer(f"✅ Модель изменена на: **{message.text}**", reply_markup=get_main_kb())
+    await message.answer(f"✅ Модель изменена на: <b>{message.text}</b>", reply_markup=get_main_kb(), parse_mode="HTML")
 
 # --- УПРАВЛЕНИЕ ШАБЛОНАМИ ---
 @dp.message(F.text == "📁 Мои шаблоны")
 async def templates_menu(message: types.Message):
     templates = get_templates()
-    text = "📂 **Твои шаблоны:**\n\n"
-    if not templates: text += "Пусто."
+    text = "📂 <b>Твои шаблоны:</b>\n\n"
+    if not templates: 
+        text += "Пусто."
     else:
-        for name, prompt in templates.items(): text += f"🔹 **{name}**\n_{prompt[:60]}..._\n\n"
-    await message.answer(text, reply_markup=get_templates_menu_kb(), parse_mode="Markdown")
+        for name, prompt in templates.items(): 
+            text += f"🔹 <b>{name}</b>\n<i>{prompt[:60]}...</i>\n\n"
+    await message.answer(text, reply_markup=get_templates_menu_kb(), parse_mode="HTML")
 
 @dp.message(F.text == "➕ Добавить шаблон")
 async def add_template_start(message: types.Message, state: FSMContext):
@@ -223,18 +218,16 @@ async def add_template_prompt(message: types.Message, state: FSMContext):
     data = await state.get_data()
     add_template(data['template_name'], message.text)
     
-    # Проверяем: если в памяти есть тема видео, значит мы пришли сюда из генератора
     if 'topic' in data:
         await message.answer(
-            f"✅ Шаблон **{data['template_name']}** создан!\n"
-            f"Продолжаем работу над сценарием: _{data['topic']}_.\n\n"
+            f"✅ Шаблон <b>{data['template_name']}</b> создан!\n"
+            f"Продолжаем работу над сценарием: <i>{data['topic']}</i>.\n\n"
             "Выберите шаблон для генерации:", 
             reply_markup=get_dynamic_templates_kb(), 
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
         await state.set_state(ScriptMaker.waiting_for_template)
     else:
-        # Если создавали просто через настройки, идем в главное меню
         await message.answer("✅ Шаблон успешно сохранен!", reply_markup=get_main_kb())
         await state.clear()
 
@@ -295,26 +288,22 @@ async def generate_script(message: types.Message, state: FSMContext):
     )
 
     try:
-        # 1. План
         plan_prompt = f"Составь план для видео '{data['topic']}' на {math.ceil(data['words_target'] / 1000)} глав. Только список названий."
         response = await client.chat.completions.create(model=model_id, messages=[{"role": "user", "content": plan_prompt}])
         plan_text = response.choices[0].message.content
+        
+        # Улучшенный поиск глав
         chapters = [c.strip() for c in plan_text.split('\n') if len(c.strip()) > 5]
-        if not chapters: chapters = [data['topic']] # Резервный вариант, если план не создался
+        if not chapters: chapters = [data['topic']]
         
         full_script = ""
         total_chapters = len(chapters)
-        
-        # --- РАСЧЕТ ВРЕМЕНИ ---
-        # Считаем, что одна глава делается ~30 секунд (генерация + пауза)
-        sec_per_chapter = 30 
+        sec_per_chapter = 35 
 
         for i, chapter in enumerate(chapters):
-            # Считаем остаток времени
             chapters_left = total_chapters - i
             est_seconds = chapters_left * sec_per_chapter
-            est_min = est_seconds // 60
-            est_sec = est_seconds % 60
+            est_min, est_sec = divmod(est_seconds, 60)
             time_str = f"{est_min} мин. {est_sec} сек." if est_min > 0 else f"{est_sec} сек."
 
             try:
@@ -326,13 +315,12 @@ async def generate_script(message: types.Message, state: FSMContext):
                     f"⏱ Осталось примерно: <b>{time_str}</b>"
                 )
                 await status_msg.edit_text(status_text, parse_mode="HTML")
-            except Exception:
-                pass # Если Телеграм временно запретил редактировать, просто идем дальше
-            chapter_prompt = f"Тема: {data['topic']}\nГлава: {chapter}\nПравила: {style_prompt}\nПиши объемно. БЕЗ ЗАГОЛОВКОВ."
+            except Exception: 
+                pass # Защита от ошибок ТГ при редактировании
+
+            chapter_prompt = f"Тема: {data['topic']}\nГлава: {chapter}\nПравила: {style_prompt}\nПиши максимально подробно. БЕЗ ЗАГОЛОВКОВ."
             resp = await client.chat.completions.create(model=model_id, messages=[{"role": "user", "content": chapter_prompt}])
             full_script += resp.choices[0].message.content + "\n\n"
-            
-            # Ждем 5 секунд между главами для стабильности API
             await asyncio.sleep(5)
 
         file_name = f"script_{task_id.replace(' ', '_')}.txt"
@@ -345,8 +333,12 @@ async def generate_script(message: types.Message, state: FSMContext):
         os.remove(file_name)
 
     except Exception as e:
-        # Безопасный вывод ошибки без Markdown
-        await status_msg.edit_text(f"❌ Ошибка задачи {task_id}\n\nТекст ошибки: {str(e)}", parse_mode=None)
+        logging.error(f"Ошибка в задаче {task_id}: {e}")
+        try:
+            # Безопасный вывод ошибки через HTML
+            await status_msg.edit_text(f"❌ <b>Ошибка задачи</b> {task_id}\n\nТекст: <code>{str(e)}</code>", parse_mode="HTML")
+        except Exception:
+            await message.answer(f"❌ Ошибка задачи {task_id}: {str(e)}")
         update_task_status(task_id, f"Error: {str(e)}")
 
     await state.clear()
