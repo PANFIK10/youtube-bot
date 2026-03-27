@@ -46,7 +46,7 @@ def get_db_connection():
     # Теперь мы просто передаем одну общую ссылку
     # sslmode='prefer' поможет, если сервер требует защищенное соединение
     return psycopg2.connect(DATABASE_URL, sslmode='prefer')
-    )
+    
 
 def init_db():
     conn = get_db_connection()
