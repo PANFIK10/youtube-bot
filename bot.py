@@ -162,6 +162,8 @@ def get_templates_menu_kb():
 def get_dynamic_templates_kb():
     templates = get_templates()
     kb = [[KeyboardButton(text=name)] for name in templates.keys()]
+    # Новая кнопка
+    kb.append([KeyboardButton(text="➕ Создать новый шаблон")]) 
     kb.append([KeyboardButton(text="🔙 Назад в меню")])
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
@@ -220,8 +222,21 @@ async def add_template_name(message: types.Message, state: FSMContext):
 async def add_template_prompt(message: types.Message, state: FSMContext):
     data = await state.get_data()
     add_template(data['template_name'], message.text)
-    await message.answer("✅ Сохранено в PostgreSQL!", reply_markup=get_main_kb())
-    await state.clear()
+    
+    # Проверяем: если в памяти есть тема видео, значит мы пришли сюда из генератора
+    if 'topic' in data:
+        await message.answer(
+            f"✅ Шаблон **{data['template_name']}** создан!\n"
+            f"Продолжаем работу над сценарием: _{data['topic']}_.\n\n"
+            "Выберите шаблон для генерации:", 
+            reply_markup=get_dynamic_templates_kb(), 
+            parse_mode="Markdown"
+        )
+        await state.set_state(ScriptMaker.waiting_for_template)
+    else:
+        # Если создавали просто через настройки, идем в главное меню
+        await message.answer("✅ Шаблон успешно сохранен!", reply_markup=get_main_kb())
+        await state.clear()
 
 @dp.message(F.text == "🗑 Удалить шаблон")
 async def delete_template_start(message: types.Message, state: FSMContext):
@@ -258,6 +273,10 @@ async def process_duration(message: types.Message, state: FSMContext):
 @dp.message(ScriptMaker.waiting_for_template)
 async def generate_script(message: types.Message, state: FSMContext):
     if message.text == "🔙 Назад в меню": return await back_to_main(message, state)
+    if message.text == "➕ Создать новый шаблон":
+        await message.answer("Введите название для нового шаблона:", reply_markup=types.ReplyKeyboardRemove())
+        await state.set_state(TemplateManager.waiting_for_new_name)
+        return
     
     templates = get_templates()
     if message.text not in templates: return
