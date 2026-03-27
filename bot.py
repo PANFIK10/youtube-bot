@@ -290,8 +290,8 @@ async def generate_script(message: types.Message, state: FSMContext):
     log_task(task_id, message.from_user.id, data['topic'], friendly_model)
 
     status_msg = await message.answer(
-        f"⏳ **Задача создана**\n\n🆔 ID: `{task_id}`\n🤖 Модель: **{friendly_model}**\n📊 Статус: Подготовка структуры...",
-        reply_markup=get_main_kb(), parse_mode="Markdown"
+        f"⏳ <b>Задача создана</b>\n\n🆔 ID: <code>{task_id}</code>\n🤖 Модель: <b>{friendly_model}</b>\n📊 Статус: Подготовка структуры...",
+        reply_markup=get_main_kb(), parse_mode="HTML"
     )
 
     try:
@@ -299,7 +299,8 @@ async def generate_script(message: types.Message, state: FSMContext):
         plan_prompt = f"Составь план для видео '{data['topic']}' на {math.ceil(data['words_target'] / 1000)} глав. Только список названий."
         response = await client.chat.completions.create(model=model_id, messages=[{"role": "user", "content": plan_prompt}])
         plan_text = response.choices[0].message.content
-        chapters = [c for c in plan_text.split('\n') if c.strip() and any(char.isdigit() for char in c[:3])]
+        chapters = [c.strip() for c in plan_text.split('\n') if len(c.strip()) > 5]
+        if not chapters: chapters = [data['topic']] # Резервный вариант, если план не создался
         
         full_script = ""
         total_chapters = len(chapters)
@@ -317,16 +318,16 @@ async def generate_script(message: types.Message, state: FSMContext):
             time_str = f"{est_min} мин. {est_sec} сек." if est_min > 0 else f"{est_sec} сек."
 
             try:
-                await status_msg.edit_text(
-                    f"🚀 **Генерация в процессе**\n\n"
-                    f"🆔 ID: `{task_id}`\n"
-                    f"🤖 Модель: **{friendly_model}**\n"
-                    f"✍️ Пишу часть: `{i+1} из {total_chapters}`\n"
-                    f"⏱ Приблизительно осталось: `{time_str}`",
-                    parse_mode="Markdown"
+                status_text = (
+                    f"🚀 <b>Генерация в процессе</b>\n\n"
+                    f"🆔 ID: <code>{task_id}</code>\n"
+                    f"🤖 Модель: <b>{friendly_model}</b>\n"
+                    f"✍️ Пишу часть: <b>{i+1} из {total_chapters}</b>\n"
+                    f"⏱ Осталось примерно: <b>{time_str}</b>"
                 )
-            except Exception: pass
-
+                await status_msg.edit_text(status_text, parse_mode="HTML")
+            except Exception:
+                pass # Если Телеграм временно запретил редактировать, просто идем дальше
             chapter_prompt = f"Тема: {data['topic']}\nГлава: {chapter}\nПравила: {style_prompt}\nПиши объемно. БЕЗ ЗАГОЛОВКОВ."
             resp = await client.chat.completions.create(model=model_id, messages=[{"role": "user", "content": chapter_prompt}])
             full_script += resp.choices[0].message.content + "\n\n"
@@ -337,7 +338,7 @@ async def generate_script(message: types.Message, state: FSMContext):
         file_name = f"script_{task_id.replace(' ', '_')}.txt"
         with open(file_name, "w", encoding="utf-8") as f: f.write(full_script)
         
-        await status_msg.edit_text(f"✅ **Готово!**\n🆔 ID: `{task_id}`\n\nСценарий отправлен файлом ниже.", parse_mode="Markdown")
+        await status_msg.edit_text(f"✅ <b>Готово!</b>\n🆔 ID: <code>{task_id}</code>\n\nСценарий отправлен файлом ниже.", parse_mode="HTML")
         await message.answer_document(FSInputFile(file_name))
         
         update_task_status(task_id, "Completed")
