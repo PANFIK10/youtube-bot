@@ -254,5 +254,9 @@ async def generate_script(message: types.Message, state: FSMContext):
 
     await state.clear()
 
+async def main():
+    print("Бот успешно запущен на сервере!")
+    await dp.start_polling(bot)
+
 if __name__ == "__main__":
     asyncio.run(main())
