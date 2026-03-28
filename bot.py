@@ -9,7 +9,7 @@ from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, FSInputFile
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton
 from openai import AsyncOpenAI
 from aiogram.exceptions import TelegramBadRequest
 
@@ -76,6 +76,15 @@ def update_task_status(task_id, status):
     conn.commit()
     c.close()
     conn.close()
+
+def get_task_status(task_id):
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT status FROM tasks WHERE task_id = %s", (task_id,))
+    row = c.fetchone()
+    c.close()
+    conn.close()
+    return row[0] if row else None
 
 def get_user_model(user_id):
     conn = get_db_connection()
@@ -243,6 +252,18 @@ async def delete_template_confirm(message: types.Message, state: FSMContext):
     await message.answer(f"🗑 Удалено: {message.text}", reply_markup=get_templates_menu_kb())
     await state.clear()
 
+@dp.callback_query(F.data.startswith("cancel_"))
+async def cancel_task_handler(call: types.CallbackQuery):
+    task_id = call.data.replace("cancel_", "")
+    update_task_status(task_id, "Cancelled") # Меняем статус в БД
+    
+    try:
+        await call.message.edit_text(f"🛑 <b>Генерация отменена пользователем</b>\n\n🆔 ID: <code>{task_id}</code>", parse_mode="HTML")
+    except Exception:
+        pass # Если ТГ не дал изменить, просто игнорируем
+        
+    await call.answer("Задача успешно отменена!", show_alert=True)
+
 # --- ГЕНЕРАЦИЯ ---
 @dp.message(F.text == "🎬 Создать сценарий")
 async def start_script(message: types.Message, state: FSMContext):
@@ -282,63 +303,89 @@ async def generate_script(message: types.Message, state: FSMContext):
     task_id = f"{random.randint(100, 999)} {random.randint(100, 999)} {random.randint(100, 999)}"
     log_task(task_id, message.from_user.id, data['topic'], friendly_model)
 
-    status_msg = await message.answer(
-        f"⏳ <b>Задача создана</b>\n\n🆔 ID: <code>{task_id}</code>\n🤖 Модель: <b>{friendly_model}</b>\n📊 Статус: Подготовка структуры...",
-        reply_markup=get_main_kb(), parse_mode="HTML"
-    )
-
     try:
+        # Уведомляем, что начали думать над планом
+        temp_msg = await message.answer("⏳ <i>Подготовка структуры сценария...</i>", parse_mode="HTML")
+        
         plan_prompt = f"Составь план для видео '{data['topic']}' на {math.ceil(data['words_target'] / 1000)} глав. Только список названий."
         response = await client.chat.completions.create(model=model_id, messages=[{"role": "user", "content": plan_prompt}])
         plan_text = response.choices[0].message.content
         
-        # Улучшенный поиск глав
         chapters = [c.strip() for c in plan_text.split('\n') if len(c.strip()) > 5]
         if not chapters: chapters = [data['topic']]
         
         full_script = ""
         total_chapters = len(chapters)
         sec_per_chapter = 35 
+        
+        # Считаем общее время ОДИН раз
+        est_seconds = total_chapters * sec_per_chapter
+        est_min, est_sec = divmod(est_seconds, 60)
+        time_str = f"{est_min} мин. {est_sec} сек." if est_min > 0 else f"{est_sec} сек."
 
+        # Создаем кнопку отмены
+        cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отменить генерацию", callback_data=f"cancel_{task_id}")]
+        ])
+
+        # Удаляем временное сообщение и шлем финальное статичное
+        try:
+            await temp_msg.delete()
+        except Exception:
+            pass
+            
+        status_msg = await message.answer(
+            f"⏳ <b>Задача принята в работу!</b>\n\n"
+            f"🆔 ID: <code>{task_id}</code>\n"
+            f"🤖 Модель: <b>{friendly_model}</b>\n"
+            f"📚 Количество частей: <b>{total_chapters}</b>\n"
+            f"⏱ Примерное время ожидания: <b>{time_str}</b>\n\n"
+            f"<i>Пожалуйста, подождите. Готовый файл будет отправлен сюда.</i>",
+            reply_markup=cancel_kb, parse_mode="HTML"
+        )
+
+        # === ЦИКЛ ГЕНЕРАЦИИ ===
         for i, chapter in enumerate(chapters):
-            chapters_left = total_chapters - i
-            est_seconds = chapters_left * sec_per_chapter
-            est_min, est_sec = divmod(est_seconds, 60)
-            time_str = f"{est_min} мин. {est_sec} сек." if est_min > 0 else f"{est_sec} сек."
-
-            try:
-                status_text = (
-                    f"🚀 <b>Генерация в процессе</b>\n\n"
-                    f"🆔 ID: <code>{task_id}</code>\n"
-                    f"🤖 Модель: <b>{friendly_model}</b>\n"
-                    f"✍️ Пишу часть: <b>{i+1} из {total_chapters}</b>\n"
-                    f"⏱ Осталось примерно: <b>{time_str}</b>"
-                )
-                await status_msg.edit_text(status_text, parse_mode="HTML")
-            except Exception: 
-                pass # Защита от ошибок ТГ при редактировании
-
+            # 1. ПРОВЕРКА НА ОТМЕНУ (перед каждой главой)
+            if get_task_status(task_id) == "Cancelled":
+                return # Если юзер нажал кнопку - просто тихо выходим
+                
+            # 2. Пишем текст
             chapter_prompt = f"Тема: {data['topic']}\nГлава: {chapter}\nПравила: {style_prompt}\nПиши максимально подробно. БЕЗ ЗАГОЛОВКОВ."
             resp = await client.chat.completions.create(model=model_id, messages=[{"role": "user", "content": chapter_prompt}])
             full_script += resp.choices[0].message.content + "\n\n"
             await asyncio.sleep(5)
 
+        # Контрольная проверка на отмену в самом конце
+        if get_task_status(task_id) == "Cancelled":
+            return
+
+        # === СОХРАНЕНИЕ И ОТПРАВКА ===
         file_name = f"script_{task_id.replace(' ', '_')}.txt"
         with open(file_name, "w", encoding="utf-8") as f: f.write(full_script)
         
-        await status_msg.edit_text(f"✅ <b>Готово!</b>\n🆔 ID: <code>{task_id}</code>\n\nСценарий отправлен файлом ниже.", parse_mode="HTML")
-        await message.answer_document(FSInputFile(file_name))
-        
+        # Надежная попытка изменить статус (если не выйдет - плевать)
+        try:
+            await status_msg.edit_text(f"✅ <b>Готово!</b>\n🆔 ID: <code>{task_id}</code>\n\nСценарий успешно сгенерирован.", parse_mode="HTML")
+        except Exception:
+            pass 
+            
+        # Гарантированная отправка файла
+        try:
+            await message.answer_document(FSInputFile(file_name))
+        except Exception as e:
+            logging.error(f"Не удалось отправить файл: {e}")
+            await message.answer("✅ Сценарий сгенерирован, но произошла ошибка при отправке файла в Telegram.")
+            
         update_task_status(task_id, "Completed")
         os.remove(file_name)
 
     except Exception as e:
         logging.error(f"Ошибка в задаче {task_id}: {e}")
         try:
-            # Безопасный вывод ошибки через HTML
-            await status_msg.edit_text(f"❌ <b>Ошибка задачи</b> {task_id}\n\nТекст: <code>{str(e)}</code>", parse_mode="HTML")
+            await message.answer(f"❌ <b>Ошибка задачи</b> {task_id}\n\nТекст: <code>{str(e)}</code>", parse_mode="HTML")
         except Exception:
-            await message.answer(f"❌ Ошибка задачи {task_id}: {str(e)}")
+            pass
         update_task_status(task_id, f"Error: {str(e)}")
 
     await state.clear()
