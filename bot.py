@@ -12,6 +12,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton
 from openai import AsyncOpenAI
 from aiogram.exceptions import TelegramBadRequest
+import aiohttp
 
 # --- КОНФИГУРАЦИЯ ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -30,7 +31,7 @@ dp = Dispatcher()
 logging.basicConfig(level=logging.INFO)
 
 WORDS_PER_MINUTE = 130
-WORDS_PER_CHAPTER = 500 # Пессимистичный расчет: заставляем бота делать больше глав
+WORDS_PER_CHAPTER = 700 # Оптимальный расчет для точности хронометража
 MODEL_NAMES = {
     "anthropic/claude-haiku-4.5": "Claude",
     "openai/gpt-5.1": "ChatGPT",
@@ -130,6 +131,18 @@ def delete_template(name):
     conn.close()
 
 init_db()
+
+async def upload_to_backup(file_path):
+    try:
+        async with aiohttp.ClientSession() as session:
+            with open(file_path, 'rb') as f:
+                # Ссылка живет 14 дней или до 1-го скачивания
+                async with session.post('https://file.io/?expires=14d', data={'file': f}) as resp:
+                    res = await resp.json()
+                    return res.get('link')
+    except Exception as e:
+        logging.error(f"Ошибка создания бэкапа: {e}")
+        return None
 
 # --- СОСТОЯНИЯ ---
 class ScriptMaker(StatesGroup):
@@ -370,14 +383,14 @@ async def generate_script(message: types.Message, state: FSMContext):
             if get_task_status(task_id) == "Cancelled":
                 return # Если юзер нажал кнопку - просто тихо выходим
                 
-            # 2. Пишем текст с жесткими рамками
+            # 2. Пишем текст с мягкими рамками объема
             chapter_prompt = (
                 f"Тема: {data['topic']}\n"
                 f"Глава: {chapter}\n"
                 f"Правила: {style_prompt}\n\n"
-                f"КРИТИЧЕСКОЕ ПРАВИЛО: Пиши максимально подробно и глубоко. "
-                f"Текст этой главы должен содержать СТРОГО НЕ МЕНЕЕ 600 СЛОВ. "
-                f"Никаких кратких пересказов, раскрывай каждую деталь. БЕЗ ЗАГОЛОВКОВ."
+                f"КРИТИЧЕСКОЕ ПРАВИЛО: Пиши максимально подробно. "
+                f"Ориентируйся на объем около 650-700 слов. "
+                f"БЕЗ ЗАГОЛОВКОВ."
             )
             resp = await client.chat.completions.create(
                 model=model_id, 
@@ -393,21 +406,35 @@ async def generate_script(message: types.Message, state: FSMContext):
 
         # === СОХРАНЕНИЕ И ОТПРАВКА ===
         file_name = f"script_{task_id.replace(' ', '_')}.txt"
-        with open(file_name, "w", encoding="utf-8") as f: f.write(full_script)
+        with open(file_name, "w", encoding="utf-8") as f: 
+            f.write(full_script)
         
-        # Надежная попытка изменить статус (если не выйдет - плевать)
+        # 1. Пробуем отправить файл в Telegram
         try:
-            await status_msg.edit_text(f"✅ <b>Готово!</b>\n🆔 ID: <code>{task_id}</code>\n\nСценарий успешно сгенерирован.", parse_mode="HTML")
-        except Exception:
-            pass 
-            
-        # Гарантированная отправка файла
-        try:
-            await message.answer_document(FSInputFile(file_name))
+            await message.answer_document(FSInputFile(file_name), caption=f"📄 Сценарий ID: {task_id}")
+            # Если успешно — просто статус "Готово"
+            try:
+                await status_msg.edit_text(f"✅ <b>Готово!</b>\n🆔 ID: <code>{task_id}</code>\n\nСценарий успешно отправлен.", parse_mode="HTML")
+            except: pass
+
         except Exception as e:
-            logging.error(f"Не удалось отправить файл: {e}")
-            await message.answer("✅ Сценарий сгенерирован, но произошла ошибка при отправке файла в Telegram.")
+            logging.error(f"ТГ не смог отправить файл {task_id}: {e}")
             
+            # 2. ТГ затупил -> Создаем бэкап-ссылку через нашу новую функцию
+            backup_link = await upload_to_backup(file_name)
+            if backup_link:
+                await message.answer(
+                    f"⚠️ <b>Telegram не смог отправить файл напрямую</b>, но я сохранил его в облаке:\n\n"
+                    f"🔗 <a href='{backup_link}'>Скачать готовый сценарий</a>\n"
+                    f"<i>(Ссылка удалится после скачивания)</i>", 
+                    parse_mode="HTML"
+                )
+                try:
+                    await status_msg.edit_text(f"✅ <b>Готово!</b>\n🆔 ID: <code>{task_id}</code>\n\nФайл доступен по ссылке выше.", parse_mode="HTML")
+                except: pass
+            else:
+                await message.answer(f"❌ Критическая ошибка: файл {task_id} не отправился.")
+
         update_task_status(task_id, "Completed")
         os.remove(file_name)
 
