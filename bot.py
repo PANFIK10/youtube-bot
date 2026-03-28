@@ -30,6 +30,7 @@ dp = Dispatcher()
 logging.basicConfig(level=logging.INFO)
 
 WORDS_PER_MINUTE = 130
+WORDS_PER_CHAPTER = 500 # Пессимистичный расчет: заставляем бота делать больше глав
 MODEL_NAMES = {
     "anthropic/claude-haiku-4.5": "Claude",
     "openai/gpt-5.1": "ChatGPT",
@@ -281,7 +282,13 @@ async def process_duration(message: types.Message, state: FSMContext):
     if not message.text.isdigit(): return
     duration = int(message.text)
     await state.update_data(duration=duration, words_target=duration * WORDS_PER_MINUTE)
-    await message.answer("Выбери шаблон:", reply_markup=get_dynamic_templates_kb())
+    
+    await message.answer(
+        "<i>⚠️ Обратите внимание: итоговый хронометраж может отличаться на ±10 минут, так как скорость речи и паузы при озвучке у всех индивидуальны.</i>\n\n"
+        "Выбери шаблон:", 
+        reply_markup=get_dynamic_templates_kb(),
+        parse_mode="HTML"
+    )
     await state.set_state(ScriptMaker.waiting_for_template)
 
 @dp.message(ScriptMaker.waiting_for_template)
@@ -307,8 +314,15 @@ async def generate_script(message: types.Message, state: FSMContext):
         # Уведомляем, что начали думать над планом
         temp_msg = await message.answer("⏳ <i>Подготовка структуры сценария...</i>", parse_mode="HTML")
         
-        plan_prompt = f"Составь план для видео '{data['topic']}' на {math.ceil(data['words_target'] / 1000)} глав. Только список названий."
-        response = await client.chat.completions.create(model=model_id, messages=[{"role": "user", "content": plan_prompt}])
+        # Жесткий расчет количества глав
+        target_chapters = math.ceil(data['words_target'] / WORDS_PER_CHAPTER)
+        
+        plan_prompt = f"Составь план для видео '{data['topic']}' ровно на {target_chapters} глав. Только пронумерованный список названий."
+        response = await client.chat.completions.create(
+            model=model_id, 
+            messages=[{"role": "user", "content": plan_prompt}],
+            max_tokens=2000 # Снимаем лимит на длину плана
+        )
         plan_text = response.choices[0].message.content
         
         chapters = [c.strip() for c in plan_text.split('\n') if len(c.strip()) > 5]
@@ -316,7 +330,7 @@ async def generate_script(message: types.Message, state: FSMContext):
         
         full_script = ""
         total_chapters = len(chapters)
-        sec_per_chapter = 35 
+        sec_per_chapter = 12 # Реальное время генерации одной главы (5 сек пауза + 7 сек ответ)
         
         # Считаем общее время ОДИН раз
         est_seconds = total_chapters * sec_per_chapter
@@ -350,9 +364,20 @@ async def generate_script(message: types.Message, state: FSMContext):
             if get_task_status(task_id) == "Cancelled":
                 return # Если юзер нажал кнопку - просто тихо выходим
                 
-            # 2. Пишем текст
-            chapter_prompt = f"Тема: {data['topic']}\nГлава: {chapter}\nПравила: {style_prompt}\nПиши максимально подробно. БЕЗ ЗАГОЛОВКОВ."
-            resp = await client.chat.completions.create(model=model_id, messages=[{"role": "user", "content": chapter_prompt}])
+            # 2. Пишем текст с жесткими рамками
+        chapter_prompt = (
+            f"Тема: {data['topic']}\n"
+            f"Глава: {chapter}\n"
+            f"Правила: {style_prompt}\n\n"
+            f"КРИТИЧЕСКОЕ ПРАВИЛО: Пиши максимально подробно и глубоко. "
+            f"Текст этой главы должен содержать СТРОГО НЕ МЕНЕЕ 600 СЛОВ. "
+            f"Никаких кратких пересказов, раскрывай каждую деталь. БЕЗ ЗАГОЛОВКОВ."
+        )
+        resp = await client.chat.completions.create(
+            model=model_id, 
+            messages=[{"role": "user", "content": chapter_prompt}],
+            max_tokens=4000 # Заставляем сервер отдавать максимум текста
+        )
             full_script += resp.choices[0].message.content + "\n\n"
             await asyncio.sleep(5)
 
