@@ -159,8 +159,8 @@ def get_models_kb():
 
 def get_templates_menu_kb():
     return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="➕ Добавить шаблон"), KeyboardButton(text="🗑 Удалить шаблон")],
-        [KeyboardButton(text="🔙 Назад в меню")]
+        [KeyboardButton(text="➕ Добавить шаблон"), KeyboardButton(text="✏️ Изменить шаблон")],
+        [KeyboardButton(text="🗑 Удалить шаблон"), KeyboardButton(text="🔙 Назад в меню")]
     ], resize_keyboard=True)
 
 def get_dynamic_templates_kb():
@@ -214,13 +214,19 @@ async def templates_menu(message: types.Message):
 
 @dp.message(F.text == "➕ Добавить шаблон")
 async def add_template_start(message: types.Message, state: FSMContext):
-    await message.answer("Введи название шаблона:", reply_markup=types.ReplyKeyboardRemove())
+    await message.answer("Введи название нового шаблона:", reply_markup=types.ReplyKeyboardRemove())
+    await state.set_state(TemplateManager.waiting_for_new_name)
+
+@dp.message(F.text == "✏️ Изменить шаблон")
+async def edit_template_start(message: types.Message, state: FSMContext):
+    await message.answer("Какой шаблон хочешь изменить?", reply_markup=get_dynamic_templates_kb())
     await state.set_state(TemplateManager.waiting_for_new_name)
 
 @dp.message(TemplateManager.waiting_for_new_name)
 async def add_template_name(message: types.Message, state: FSMContext):
+    if message.text == "🔙 Назад в меню": return await back_to_main(message, state)
     await state.update_data(template_name=message.text)
-    await message.answer("Текст промпта:")
+    await message.answer("Отправь новый текст промпта для этого шаблона:", reply_markup=types.ReplyKeyboardRemove())
     await state.set_state(TemplateManager.waiting_for_new_prompt)
 
 @dp.message(TemplateManager.waiting_for_new_prompt)
@@ -230,7 +236,7 @@ async def add_template_prompt(message: types.Message, state: FSMContext):
     
     if 'topic' in data:
         await message.answer(
-            f"✅ Шаблон <b>{data['template_name']}</b> создан!\n"
+            f"✅ Шаблон <b>{data['template_name']}</b> сохранен!\n"
             f"Продолжаем работу над сценарием: <i>{data['topic']}</i>.\n\n"
             "Выберите шаблон для генерации:", 
             reply_markup=get_dynamic_templates_kb(), 
@@ -256,12 +262,12 @@ async def delete_template_confirm(message: types.Message, state: FSMContext):
 @dp.callback_query(F.data.startswith("cancel_"))
 async def cancel_task_handler(call: types.CallbackQuery):
     task_id = call.data.replace("cancel_", "")
-    update_task_status(task_id, "Cancelled") # Меняем статус в БД
+    update_task_status(task_id, "Cancelled") 
     
     try:
         await call.message.edit_text(f"🛑 <b>Генерация отменена пользователем</b>\n\n🆔 ID: <code>{task_id}</code>", parse_mode="HTML")
     except Exception:
-        pass # Если ТГ не дал изменить, просто игнорируем
+        pass 
         
     await call.answer("Задача успешно отменена!", show_alert=True)
 
@@ -365,19 +371,19 @@ async def generate_script(message: types.Message, state: FSMContext):
                 return # Если юзер нажал кнопку - просто тихо выходим
                 
             # 2. Пишем текст с жесткими рамками
-        chapter_prompt = (
-            f"Тема: {data['topic']}\n"
-            f"Глава: {chapter}\n"
-            f"Правила: {style_prompt}\n\n"
-            f"КРИТИЧЕСКОЕ ПРАВИЛО: Пиши максимально подробно и глубоко. "
-            f"Текст этой главы должен содержать СТРОГО НЕ МЕНЕЕ 600 СЛОВ. "
-            f"Никаких кратких пересказов, раскрывай каждую деталь. БЕЗ ЗАГОЛОВКОВ."
-        )
-        resp = await client.chat.completions.create(
-            model=model_id, 
-            messages=[{"role": "user", "content": chapter_prompt}],
-            max_tokens=4000 # Заставляем сервер отдавать максимум текста
-        )
+            chapter_prompt = (
+                f"Тема: {data['topic']}\n"
+                f"Глава: {chapter}\n"
+                f"Правила: {style_prompt}\n\n"
+                f"КРИТИЧЕСКОЕ ПРАВИЛО: Пиши максимально подробно и глубоко. "
+                f"Текст этой главы должен содержать СТРОГО НЕ МЕНЕЕ 600 СЛОВ. "
+                f"Никаких кратких пересказов, раскрывай каждую деталь. БЕЗ ЗАГОЛОВКОВ."
+            )
+            resp = await client.chat.completions.create(
+                model=model_id, 
+                messages=[{"role": "user", "content": chapter_prompt}],
+                max_tokens=4000 # Заставляем сервер отдавать максимум текста
+            )
             full_script += resp.choices[0].message.content + "\n\n"
             await asyncio.sleep(5)
 
@@ -416,7 +422,7 @@ async def generate_script(message: types.Message, state: FSMContext):
     await state.clear()
 
 async def main():
-    print("Бот на PostgreSQL запущен!")
+    print("Бот на PostgreSQL запущен и готов к работе!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
