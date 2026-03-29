@@ -377,30 +377,51 @@ async def generate_script(message: types.Message, state: FSMContext):
             reply_markup=cancel_kb, parse_mode="HTML"
         )
 
-        # === ЦИКЛ ГЕНЕРАЦИИ ===
-        for i, chapter in enumerate(chapters):
-            # 1. ПРОВЕРКА НА ОТМЕНУ (перед каждой главой)
+        # === ПАРАЛЛЕЛЬНАЯ ГЕНЕРАЦИЯ (СУПЕРСКОРОСТЬ) ===
+        full_script_parts = [""] * total_chapters
+        
+        async def generate_single_chapter(index, chapter_title):
             if get_task_status(task_id) == "Cancelled":
-                return # Если юзер нажал кнопку - просто тихо выходим
-                
-            # 2. Мульти-метрические рамки объема (Символы + Время + Предложения)
+                return
+            
             chapter_prompt = (
                 f"Тема видео: {data['topic']}\n"
-                f"Суть этой части: {chapter}\n"
+                f"Суть этой части: {chapter_title}\n"
                 f"Стиль: {style_prompt}\n\n"
                 f"КРИТИЧЕСКИЕ ПРАВИЛА (ШТРАФ ЗА НАРУШЕНИЕ):\n"
                 f"1. ЖЕСТКИЙ ОБЪЕМ: Напиши строго 2000-2500 символов (это около 20-25 длинных предложений или 2,5 минуты непрерывной речи). Заверши мысль, уложившись в этот лимит.\n"
                 f"2. ФОРМАТ: КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО писать заголовки! Никаких символов '#', никаких 'Глава', 'Часть'. Пиши ТОЛЬКО сплошной текст.\n"
                 f"3. НАЧАЛО: Начинай сразу с первого предложения текста, без вступлений."
             )
+            try:
+                resp = await client.chat.completions.create(
+                    model=model_id, 
+                    messages=[{"role": "user", "content": chapter_prompt}],
+                    max_tokens=1300
+                )
+                full_script_parts[index] = resp.choices[0].message.content + "\n\n"
+                # --- ЛОГ УСПЕШНОЙ ГЕНЕРАЦИИ ---
+                logging.info(f"[{task_id}] ✅ Часть {index+1} из {total_chapters} успешно готова!")
+            except Exception as e:
+                logging.error(f"[{task_id}] ❌ Ошибка в части {index+1}: {e}")
+                full_script_parts[index] = f"[Ошибка генерации части {index+1}]\n\n"
+
+        # Запускаем пачками по 5 запросов одновременно
+        chunk_size = 5
+        for i in range(0, total_chapters, chunk_size):
+            if get_task_status(task_id) == "Cancelled":
+                return
+                
+            chunk = chapters[i:i + chunk_size]
+            # --- ЛОГ ЗАПУСКА ПАЧКИ ---
+            logging.info(f"[{task_id}] 🚀 ОТПРАВЛЯЮ ПАЧКУ: части с {i+1} по {min(i+chunk_size, total_chapters)}...")
             
-            resp = await client.chat.completions.create(
-                model=model_id, 
-                messages=[{"role": "user", "content": chapter_prompt}],
-                max_tokens=1300 # Физический потолок. Сервер просто не даст модели написать больше ~600 слов.
-            )
-            full_script += resp.choices[0].message.content + "\n\n"
-            await asyncio.sleep(5)
+            tasks = [generate_single_chapter(i + j, title) for j, title in enumerate(chunk)]
+            await asyncio.gather(*tasks) # Ждем завершения всей пачки
+            
+            await asyncio.sleep(2) # Короткая пауза между пачками для безопасности API
+
+        full_script = "".join(full_script_parts)
 
         # Контрольная проверка на отмену в самом конце
         if get_task_status(task_id) == "Cancelled":
