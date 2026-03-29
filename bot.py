@@ -31,7 +31,7 @@ dp = Dispatcher()
 logging.basicConfig(level=logging.INFO)
 
 WORDS_PER_MINUTE = 130
-WORDS_PER_CHAPTER = 700 # Оптимальный расчет для точности хронометража
+WORDS_PER_CHAPTER = 500 # Золотая середина для баланса разных моделей
 MODEL_NAMES = {
     "anthropic/claude-haiku-4.5": "Claude",
     "openai/gpt-5.1": "ChatGPT",
@@ -385,12 +385,11 @@ async def generate_script(message: types.Message, state: FSMContext):
                 
             # 2. Пишем текст с мягкими рамками объема
             chapter_prompt = (
-                f"Тема: {data['topic']}\n"
-                f"Глава: {chapter}\n"
+                f"Тема всего видео: {data['topic']}\n"
+                f"Твоя задача написать сплошной текст только для этой части: {chapter}\n"
                 f"Правила: {style_prompt}\n\n"
-                f"КРИТИЧЕСКОЕ ПРАВИЛО: Пиши максимально подробно. "
-                f"Ориентируйся на объем около 650-700 слов. "
-                f"БЕЗ ЗАГОЛОВКОВ."
+                f"КРИТИЧЕСКОЕ ПРАВИЛО 1: НАЧИНАЙ СРАЗУ С ТЕКСТА. Категорически запрещено писать заголовки! Не используй символ '#', не пиши номер и название части.\n"
+                f"КРИТИЧЕСКОЕ ПРАВИЛО 2: Пиши максимально подробно. Текст должен содержать СТРОГО НЕ МЕНЕЕ 600 СЛОВ. Раскрывай каждую мысль глубоко и детально."
             )
             resp = await client.chat.completions.create(
                 model=model_id, 
