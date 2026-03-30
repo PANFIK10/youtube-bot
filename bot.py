@@ -145,7 +145,12 @@ def get_user_model(user_id) -> str:
         c = conn.cursor()
         c.execute("SELECT model_name FROM settings WHERE user_id=%s", (user_id,))
         row = c.fetchone()
-        return row[0] if row else "x-ai/grok-4.1-fast"(user_id, model_name):
+        return row[0] if row else "x-ai/grok-4.1-fast"
+    finally:
+        conn.close()
+
+
+def set_user_model(user_id, model_name):
     with get_db() as conn:
         c = conn.cursor()
         c.execute(
