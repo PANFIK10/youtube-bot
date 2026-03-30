@@ -3,9 +3,8 @@ import logging
 import math
 import os
 import re
-import psycopg2
+import asyncpg
 import random
-from contextlib import contextmanager
 from datetime import datetime
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -22,19 +21,80 @@ import aiohttp
 # ---------------------------------------------------------------------------
 # КОНФИГУРАЦИЯ
 # ---------------------------------------------------------------------------
-TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-DATABASE_URL      = os.getenv("DATABASE_URL")
+TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN")
+DATABASE_URL       = os.getenv("DATABASE_URL")
 
-client = AsyncOpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=OPENROUTER_API_KEY,
-    timeout=120.0,
-)
+# ── Пул API-ключей OpenRouter ──────────────────────────────────────────────
+# Основной ключ + до 4 дополнительных. Берём все что есть в env.
+_raw_keys = [
+    os.getenv("OPENROUTER_API_KEY"),
+    os.getenv("OPENROUTER_API_KEY_1"),
+    os.getenv("OPENROUTER_API_KEY_2"),
+    os.getenv("OPENROUTER_API_KEY_3"),
+    os.getenv("OPENROUTER_API_KEY_4"),
+]
+API_KEYS: list[str] = [k for k in _raw_keys if k]   # убираем незаданные
+if not API_KEYS:
+    raise RuntimeError("Не задан ни один OPENROUTER_API_KEY в переменных окружения")
+
+# Создаём отдельный AsyncOpenAI-клиент на каждый ключ
+_clients = [
+    AsyncOpenAI(base_url="https://openrouter.ai/api/v1", api_key=key, timeout=120.0)
+    for key in API_KEYS
+]
+_key_index = 0          # курсор round-robin
+_key_lock  = None       # asyncio.Lock — инициализируется в on_startup
+
+def _next_client() -> AsyncOpenAI:
+    """Round-robin по пулу клиентов. Потокобезопасно для asyncio."""
+    global _key_index
+    client = _clients[_key_index % len(_clients)]
+    _key_index += 1
+    return client
+
+# ── Семафор очереди ────────────────────────────────────────────────────────
+# Не более MAX_CONCURRENT_TASKS задач генерируются одновременно.
+# Остальные ждут в очереди — пользователь видит сообщение об этом.
+MAX_CONCURRENT_TASKS = 10
+_generation_semaphore: asyncio.Semaphore | None = None  # инициализируется в on_startup
+
+# ── Retry-параметры ────────────────────────────────────────────────────────
+API_RETRY_ATTEMPTS = 3          # сколько раз повторять при ошибке API
+API_RETRY_BASE_DELAY = 2.0      # начальная пауза (сек), удваивается каждый раз
 
 bot = Bot(token=TELEGRAM_TOKEN)
 dp  = Dispatcher()
 logging.basicConfig(level=logging.INFO)
+
+# Глобальный пул соединений asyncpg
+db_pool: asyncpg.Pool | None = None
+
+# Инициализируем asyncio-объекты при старте бота
+@dp.startup()
+async def on_startup():
+    global _generation_semaphore, _key_lock, db_pool
+    _generation_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
+    _key_lock = asyncio.Lock()
+
+    # Создаём пул asyncpg (min 2, max 10 соединений)
+    db_pool = await asyncpg.create_pool(
+        DATABASE_URL,
+        min_size=2,
+        max_size=10,
+        ssl="prefer",
+    )
+    await init_db()
+    logging.info(
+        f"БД: asyncpg пул готов | "
+        f"Ключей API: {len(API_KEYS)} | "
+        f"Очередь: max {MAX_CONCURRENT_TASKS} задач"
+    )
+
+@dp.shutdown()
+async def on_shutdown():
+    if db_pool:
+        await db_pool.close()
+    logging.info("БД: пул соединений закрыт")
 
 # ---------------------------------------------------------------------------
 # КОНСТАНТЫ ГЕНЕРАЦИИ
@@ -71,126 +131,144 @@ MODEL_NAMES = {
 }
 
 # ---------------------------------------------------------------------------
-# РАБОТА С PostgreSQL
+# РАБОТА С PostgreSQL (asyncpg)
 # ---------------------------------------------------------------------------
-@contextmanager
-def get_db():
-    conn = psycopg2.connect(DATABASE_URL, sslmode='prefer')
-    try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
 
-
-def _read_conn():
-    """Лёгкое соединение только для SELECT."""
-    conn = psycopg2.connect(DATABASE_URL, sslmode='prefer')
-    conn.autocommit = True
-    return conn
-
-
-def init_db():
-    with get_db() as conn:
-        c = conn.cursor()
-        c.execute("CREATE TABLE IF NOT EXISTS templates (name TEXT PRIMARY KEY, prompt TEXT)")
-        c.execute("CREATE TABLE IF NOT EXISTS settings  (user_id BIGINT PRIMARY KEY, model_name TEXT)")
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS tasks (
-                task_id TEXT PRIMARY KEY, user_id BIGINT,
-                topic TEXT, model TEXT, status TEXT, created_at TEXT
+async def init_db():
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS templates (
+                name TEXT PRIMARY KEY,
+                prompt TEXT
             )
         """)
-        c.execute("SELECT COUNT(*) FROM templates")
-        if c.fetchone()[0] == 0:
-            c.execute(
-                "INSERT INTO templates (name, prompt) VALUES (%s, %s)",
-                ("🎬 Стандартный", "Напиши увлекательный сценарий для YouTube.")
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                user_id BIGINT PRIMARY KEY,
+                model_name TEXT
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS tasks (
+                task_id TEXT PRIMARY KEY,
+                user_id BIGINT,
+                topic TEXT,
+                model TEXT,
+                status TEXT,
+                created_at TEXT
+            )
+        """)
+        count = await conn.fetchval("SELECT COUNT(*) FROM templates")
+        if count == 0:
+            await conn.execute(
+                "INSERT INTO templates (name, prompt) VALUES ($1, $2)",
+                "🎬 Стандартный", "Напиши увлекательный сценарий для YouTube.",
             )
 
 
-def log_task(task_id, user_id, topic, model):
-    with get_db() as conn:
-        c = conn.cursor()
-        now = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
-        c.execute(
-            "INSERT INTO tasks VALUES (%s,%s,%s,%s,%s,%s)",
-            (task_id, user_id, topic, model, "In Progress", now),
+async def log_task(task_id, user_id, topic, model):
+    now = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO tasks VALUES ($1,$2,$3,$4,$5,$6)",
+            task_id, user_id, topic, model, "In Progress", now,
         )
 
 
-def update_task_status(task_id, status):
-    with get_db() as conn:
-        c = conn.cursor()
-        c.execute("UPDATE tasks SET status=%s WHERE task_id=%s", (status, task_id))
-
-
-def get_task_status(task_id) -> str | None:
-    conn = _read_conn()
-    try:
-        c = conn.cursor()
-        c.execute("SELECT status FROM tasks WHERE task_id=%s", (task_id,))
-        row = c.fetchone()
-        return row[0] if row else None
-    finally:
-        conn.close()
-
-
-def get_user_model(user_id) -> str:
-    conn = _read_conn()
-    try:
-        c = conn.cursor()
-        c.execute("SELECT model_name FROM settings WHERE user_id=%s", (user_id,))
-        row = c.fetchone()
-        return row[0] if row else "x-ai/grok-4.1-fast"
-    finally:
-        conn.close()
-
-
-def set_user_model(user_id, model_name):
-    with get_db() as conn:
-        c = conn.cursor()
-        c.execute(
-            "INSERT INTO settings (user_id, model_name) VALUES (%s,%s) "
-            "ON CONFLICT (user_id) DO UPDATE SET model_name=EXCLUDED.model_name",
-            (user_id, model_name),
+async def update_task_status(task_id, status):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE tasks SET status=$1 WHERE task_id=$2",
+            status, task_id,
         )
 
 
-def get_templates() -> dict:
-    conn = _read_conn()
-    try:
-        c = conn.cursor()
-        c.execute("SELECT name, prompt FROM templates")
-        return {row[0]: row[1] for row in c.fetchall()}
-    finally:
-        conn.close()
+async def get_task_status(task_id) -> str | None:
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT status FROM tasks WHERE task_id=$1", task_id
+        )
+    return row["status"] if row else None
 
 
-def add_template(name, prompt):
-    with get_db() as conn:
-        c = conn.cursor()
-        c.execute(
-            "INSERT INTO templates (name, prompt) VALUES (%s,%s) "
-            "ON CONFLICT (name) DO UPDATE SET prompt=EXCLUDED.prompt",
-            (name, prompt),
+async def get_user_model(user_id) -> str:
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT model_name FROM settings WHERE user_id=$1", user_id
+        )
+    return row["model_name"] if row else "x-ai/grok-4.1-fast"
+
+
+async def set_user_model(user_id, model_name):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO settings (user_id, model_name) VALUES ($1, $2)
+            ON CONFLICT (user_id) DO UPDATE SET model_name = EXCLUDED.model_name
+            """,
+            user_id, model_name,
         )
 
 
-def delete_template(name):
-    with get_db() as conn:
-        c = conn.cursor()
-        c.execute("DELETE FROM templates WHERE name=%s", (name,))
+async def get_templates() -> dict:
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT name, prompt FROM templates")
+    return {row["name"]: row["prompt"] for row in rows}
 
 
-init_db()
+async def add_template(name, prompt):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO templates (name, prompt) VALUES ($1, $2)
+            ON CONFLICT (name) DO UPDATE SET prompt = EXCLUDED.prompt
+            """,
+            name, prompt,
+        )
+
+
+async def delete_template(name):
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM templates WHERE name=$1", name)
+
 
 # ---------------------------------------------------------------------------
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ---------------------------------------------------------------------------
+
+async def api_call_with_retry(model_id: str, messages: list, max_tokens: int) -> str:
+    """
+    Вызов OpenRouter с автоматическим retry и ротацией ключей.
+    При ошибке rate-limit или сетевой ошибке — ждёт и пробует следующий ключ.
+    Возвращает текст ответа или бросает исключение после всех попыток.
+    """
+    last_exc = None
+    for attempt in range(API_RETRY_ATTEMPTS):
+        async with _key_lock:
+            c = _next_client()
+        try:
+            resp = await c.chat.completions.create(
+                model=model_id,
+                messages=messages,
+                max_tokens=max_tokens,
+            )
+            return resp.choices[0].message.content
+        except Exception as e:
+            last_exc = e
+            err_str = str(e).lower()
+            # Rate limit или сервер перегружен — ждём с экспоненциальной задержкой
+            if any(x in err_str for x in ("rate", "429", "502", "503", "timeout")):
+                delay = API_RETRY_BASE_DELAY * (2 ** attempt)
+                logging.warning(
+                    f"API ошибка (попытка {attempt+1}/{API_RETRY_ATTEMPTS}): {e} "
+                    f"— повтор через {delay:.1f}с"
+                )
+                await asyncio.sleep(delay)
+            else:
+                # Не сетевая ошибка — сразу бросаем
+                raise
+    raise last_exc
+
 
 def clean_chapter_text(text: str) -> str:
     """
@@ -367,38 +445,38 @@ def get_templates_menu_kb():
         [KeyboardButton(text="🗑 Удалить шаблон"),  KeyboardButton(text="🔙 Назад в меню")],
     ], resize_keyboard=True)
 
-def get_dynamic_templates_kb():
-    templates = get_templates()
+async def get_dynamic_templates_kb(for_generation: bool = False):
+    """
+    for_generation=True  — выбор шаблона при создании сценария (без кнопки «Создать новый»)
+    for_generation=False — управление шаблонами (с кнопкой «Создать новый»)
+    """
+    templates = await get_templates()
     kb = [[KeyboardButton(text=name)] for name in templates]
-    kb.append([KeyboardButton(text="➕ Создать новый шаблон")])
+    if not for_generation:
+        kb.append([KeyboardButton(text="➕ Создать новый шаблон")])
     kb.append([KeyboardButton(text="🔙 Назад в меню")])
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
 # ---------------------------------------------------------------------------
 # ХЭНДЛЕРЫ — навигация
 # ---------------------------------------------------------------------------
+WELCOME_TEXT = (
+    "👋 <b>Добро пожаловать в генератор сценариев!</b>\n\n"
+    "Создавайте готовые сценарии без борьбы с лимитами и склеек.\n\n"
+    "🎭 <b>Claude</b> — стиль.\n🧠 <b>ChatGPT</b> — логика.\n"
+    "⚡ <b>Gemini</b> — скорость.\n🔥 <b>Grok</b> — дерзость."
+)
+
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message, state: FSMContext):
     await state.clear()
-    text = (
-        "👋 <b>Добро пожаловать в генератор сценариев!</b>\n\n"
-        "Создавайте готовые сценарии без борьбы с лимитами и склеек.\n\n"
-        "🎭 <b>Claude</b> — стиль.\n🧠 <b>ChatGPT</b> — логика.\n"
-        "⚡ <b>Gemini</b> — скорость.\n🔥 <b>Grok</b> — дерзость."
-    )
-    await message.answer(text, reply_markup=get_main_kb(), parse_mode="HTML")
+    await message.answer(WELCOME_TEXT, reply_markup=get_main_kb(), parse_mode="HTML")
 
 
 @dp.message(F.text == "🔄 Перезапустить")
 async def restart_cmd(message: types.Message, state: FSMContext):
     await state.clear()
-    text = (
-        "👋 <b>Добро пожаловать в генератор сценариев!</b>\n\n"
-        "Создавайте готовые сценарии без борьбы с лимитами и склеек.\n\n"
-        "🎭 <b>Claude</b> — стиль.\n🧠 <b>ChatGPT</b> — логика.\n"
-        "⚡ <b>Gemini</b> — скорость.\n🔥 <b>Grok</b> — дерзость."
-    )
-    await message.answer(text, reply_markup=get_main_kb(), parse_mode="HTML")
+    await message.answer(WELCOME_TEXT, reply_markup=get_main_kb(), parse_mode="HTML")
 
 
 @dp.message(F.text == "🔙 Назад в меню")
@@ -409,7 +487,7 @@ async def back_to_main(message: types.Message, state: FSMContext):
 
 @dp.message(F.text == "⚙️ Настройки")
 async def settings_menu(message: types.Message):
-    cur = get_user_model(message.from_user.id)
+    cur = await get_user_model(message.from_user.id)
     friendly = MODEL_NAMES.get(cur, cur)
     await message.answer(
         f"⚙️ <b>Настройки интеллекта</b>\n\nТекущая модель: <b>{friendly}</b>",
@@ -420,7 +498,7 @@ async def settings_menu(message: types.Message):
 @dp.message(F.text.in_(MODEL_NAMES.values()))
 async def change_model(message: types.Message):
     inv = {v: k for k, v in MODEL_NAMES.items()}
-    set_user_model(message.from_user.id, inv[message.text])
+    await set_user_model(message.from_user.id, inv[message.text])
     await message.answer(
         f"✅ Модель изменена на: <b>{message.text}</b>",
         reply_markup=get_main_kb(), parse_mode="HTML",
@@ -431,7 +509,7 @@ async def change_model(message: types.Message):
 # ---------------------------------------------------------------------------
 @dp.message(F.text == "📁 Мои шаблоны")
 async def templates_menu(message: types.Message):
-    templates = get_templates()
+    templates = await get_templates()
     text = "📂 <b>Твои шаблоны:</b>\n\n"
     if not templates:
         text += "Пусто."
@@ -449,7 +527,7 @@ async def add_template_start(message: types.Message, state: FSMContext):
 
 @dp.message(F.text == "✏️ Изменить шаблон")
 async def edit_template_start(message: types.Message, state: FSMContext):
-    await message.answer("Какой шаблон хочешь изменить?", reply_markup=get_dynamic_templates_kb())
+    await message.answer("Какой шаблон хочешь изменить?", reply_markup=await get_dynamic_templates_kb())
     await state.set_state(TemplateManager.waiting_for_new_name)
 
 
@@ -468,13 +546,13 @@ async def add_template_name(message: types.Message, state: FSMContext):
 @dp.message(TemplateManager.waiting_for_new_prompt)
 async def add_template_prompt(message: types.Message, state: FSMContext):
     data = await state.get_data()
-    add_template(data['template_name'], message.text)
+    await add_template(data['template_name'], message.text)
     if 'topic' in data:
         await message.answer(
             f"✅ Шаблон <b>{data['template_name']}</b> сохранён!\n"
             f"Продолжаем работу над сценарием: <i>{data['topic']}</i>.\n\n"
             "Выберите шаблон для генерации:",
-            reply_markup=get_dynamic_templates_kb(), parse_mode="HTML",
+            reply_markup=await get_dynamic_templates_kb(for_generation=True), parse_mode="HTML",
         )
         await state.set_state(ScriptMaker.waiting_for_template)
     else:
@@ -484,7 +562,7 @@ async def add_template_prompt(message: types.Message, state: FSMContext):
 
 @dp.message(F.text == "🗑 Удалить шаблон")
 async def delete_template_start(message: types.Message, state: FSMContext):
-    await message.answer("Что удалить?", reply_markup=get_dynamic_templates_kb())
+    await message.answer("Что удалить?", reply_markup=await get_dynamic_templates_kb())
     await state.set_state(TemplateManager.waiting_for_delete_name)
 
 
@@ -492,7 +570,7 @@ async def delete_template_start(message: types.Message, state: FSMContext):
 async def delete_template_confirm(message: types.Message, state: FSMContext):
     if message.text == "🔙 Назад в меню":
         return await back_to_main(message, state)
-    delete_template(message.text)
+    await delete_template(message.text)
     await message.answer(f"🗑 Удалено: {message.text}", reply_markup=get_templates_menu_kb())
     await state.clear()
 
@@ -500,15 +578,24 @@ async def delete_template_confirm(message: types.Message, state: FSMContext):
 @dp.callback_query(F.data.startswith("cancel_"))
 async def cancel_task_handler(call: types.CallbackQuery):
     task_id = call.data.replace("cancel_", "")
-    update_task_status(task_id, "Cancelled")
+    await update_task_status(task_id, "Cancelled")
     try:
         await call.message.edit_text(
-            f"🛑 <b>Генерация отменена пользователем</b>\n\n🆔 ID: <code>{task_id}</code>",
+            f"🛑 <b>Генерация отменена</b>\n\n🆔 ID: <code>{task_id}</code>",
             parse_mode="HTML",
         )
     except Exception:
         pass
-    await call.answer("Задача успешно отменена!", show_alert=True)
+    # Показываем клавиатуру для быстрого старта нового сценария
+    new_script_kb = ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text="🎬 Создать сценарий")],
+        [KeyboardButton(text="🔙 Назад в меню")],
+    ], resize_keyboard=True)
+    await call.message.answer(
+        "Хочешь создать новый сценарий?",
+        reply_markup=new_script_kb,
+    )
+    await call.answer()
 
 # ---------------------------------------------------------------------------
 # ХЭНДЛЕРЫ — создание сценария
@@ -528,7 +615,8 @@ async def process_topic(message: types.Message, state: FSMContext):
 
 @dp.message(ScriptMaker.waiting_for_duration)
 async def process_duration(message: types.Message, state: FSMContext):
-    if not message.text.isdigit():
+    if not message.text.isdigit() or int(message.text) < 1:
+        await message.answer("⚠️ Введите длительность числом, например: <b>60</b>", parse_mode="HTML")
         return
     duration = int(message.text)
     await state.update_data(duration=duration, words_target=duration * WORDS_PER_MINUTE)
@@ -536,7 +624,7 @@ async def process_duration(message: types.Message, state: FSMContext):
         "<i>⚠️ Обратите внимание: итоговый хронометраж может отличаться на ±10 минут, "
         "так как скорость речи и паузы при озвучке у всех индивидуальны.</i>\n\n"
         "Выбери шаблон:",
-        reply_markup=get_dynamic_templates_kb(), parse_mode="HTML",
+        reply_markup=await get_dynamic_templates_kb(for_generation=True), parse_mode="HTML",
     )
     await state.set_state(ScriptMaker.waiting_for_template)
 
@@ -556,18 +644,29 @@ async def generate_script(message: types.Message, state: FSMContext):
         await state.set_state(TemplateManager.waiting_for_new_name)
         return
 
-    templates = get_templates()
+    templates = await get_templates()
     if message.text not in templates:
         return
 
     style_prompt  = templates[message.text]
     data          = await state.get_data()
-    model_id      = get_user_model(message.from_user.id)
+    model_id      = await get_user_model(message.from_user.id)
     friendly_model = MODEL_NAMES.get(model_id, "AI")
     words_target  = data['words_target']
 
     task_id = f"{random.randint(100,999)} {random.randint(100,999)} {random.randint(100,999)}"
-    log_task(task_id, message.from_user.id, data['topic'], friendly_model)
+    await log_task(task_id, message.from_user.id, data['topic'], friendly_model)
+
+    file_name = f"script_{task_id.replace(' ', '_')}.txt"
+
+    # Если все слоты заняты — предупреждаем пользователя и ждём в очереди
+    if _generation_semaphore._value == 0:
+        await message.answer(
+            "⏳ <b>Все слоты заняты.</b> Твоя задача поставлена в очередь — "
+            "генерация начнётся автоматически, как только освободится место.",
+            parse_mode="HTML",
+        )
+    await _generation_semaphore.acquire()
 
     try:
         # ── ФАЗА 0: уведомление ────────────────────────────────────────────
@@ -585,12 +684,12 @@ async def generate_script(message: types.Message, state: FSMContext):
             f"Темы НЕ должны пересекаться или повторять друг друга.\n"
             f"Формат: только нумерованный список без пояснений и вступлений."
         )
-        resp = await client.chat.completions.create(
-            model=model_id,
-            messages=[{"role": "user", "content": plan_prompt}],
+        resp_text = await api_call_with_retry(
+            model_id,
+            [{"role": "user", "content": plan_prompt}],
             max_tokens=2500,
         )
-        plan_text = resp.choices[0].message.content
+        plan_text = resp_text
         chapters  = parse_plan_chapters(plan_text, target_chapters)
         n         = len(chapters)
 
@@ -639,7 +738,7 @@ async def generate_script(message: types.Message, state: FSMContext):
 
         async def generate_chapter(index: int, title: str, is_regen: bool = False) -> None:
             """Генерирует одну часть сценария и кладёт результат в full_script_parts."""
-            if get_task_status(task_id) == "Cancelled":
+            if await get_task_status(task_id) == "Cancelled":
                 return
 
             include_cta = (index in cta_positions) and not is_regen
@@ -671,12 +770,11 @@ async def generate_script(message: types.Message, state: FSMContext):
                 f"{cta_instruction}"
             )
             try:
-                r = await client.chat.completions.create(
-                    model=model_id,
-                    messages=[{"role": "user", "content": prompt}],
+                raw   = await api_call_with_retry(
+                    model_id,
+                    [{"role": "user", "content": prompt}],
                     max_tokens=max_tokens_chapter,
                 )
-                raw   = r.choices[0].message.content
                 clean = clean_chapter_text(raw)
                 full_script_parts[index] = clean + "\n\n"
                 wc = len(clean.split())
@@ -691,7 +789,7 @@ async def generate_script(message: types.Message, state: FSMContext):
         # Пачки по chunk_size параллельных запросов
         done_count = 0
         for batch_start in range(0, n, chunk_size):
-            if get_task_status(task_id) == "Cancelled":
+            if await get_task_status(task_id) == "Cancelled":
                 return
 
             batch_indices = list(range(batch_start, min(batch_start + chunk_size, n)))
@@ -714,7 +812,7 @@ async def generate_script(message: types.Message, state: FSMContext):
             )
             await asyncio.sleep(2)
 
-        if get_task_status(task_id) == "Cancelled":
+        if await get_task_status(task_id) == "Cancelled":
             return
 
         # ── ФАЗА 4: доработка коротких частей ─────────────────────────────
@@ -734,7 +832,7 @@ async def generate_script(message: types.Message, state: FSMContext):
             )
 
             for attempt in range(MAX_REGEN_ATTEMPTS):
-                if get_task_status(task_id) == "Cancelled":
+                if await get_task_status(task_id) == "Cancelled":
                     return
                 if not short_indices:
                     break
@@ -753,7 +851,7 @@ async def generate_script(message: types.Message, state: FSMContext):
                     f"[{task_id}] 🔧 Попытка {attempt+1}: осталось коротких — {len(short_indices)}"
                 )
 
-        if get_task_status(task_id) == "Cancelled":
+        if await get_task_status(task_id) == "Cancelled":
             return
 
         # ── ФАЗА 5: сборка и отправка ──────────────────────────────────────
@@ -767,7 +865,6 @@ async def generate_script(message: types.Message, state: FSMContext):
             f"цель: {words_target} | отклонение: {deviation:+d} ({deviation/words_target*100:+.1f}%)"
         )
 
-        file_name = f"script_{task_id.replace(' ', '_')}.txt"
         with open(file_name, "w", encoding="utf-8") as f:
             f.write(full_script)
 
@@ -799,8 +896,7 @@ async def generate_script(message: types.Message, state: FSMContext):
             else:
                 await message.answer(f"❌ Критическая ошибка: файл {task_id} не отправился.")
 
-        update_task_status(task_id, "Completed")
-        os.remove(file_name)
+        await update_task_status(task_id, "Completed")
 
         # Кнопка быстрого перехода к новому сценарию
         new_script_kb = ReplyKeyboardMarkup(keyboard=[
@@ -821,9 +917,14 @@ async def generate_script(message: types.Message, state: FSMContext):
             )
         except Exception:
             pass
-        update_task_status(task_id, f"Error: {str(e)}")
+        await update_task_status(task_id, f"Error: {str(e)}")
 
-    await state.clear()
+    finally:
+        # Гарантированно освобождаем слот очереди, очищаем state и файл
+        _generation_semaphore.release()
+        await state.clear()
+        if os.path.exists(file_name):
+            os.remove(file_name)
 
 
 # ---------------------------------------------------------------------------
