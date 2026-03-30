@@ -55,8 +55,9 @@ def _next_client() -> AsyncOpenAI:
 # ── Семафор очереди ────────────────────────────────────────────────────────
 # Не более MAX_CONCURRENT_TASKS задач генерируются одновременно.
 # Остальные ждут в очереди — пользователь видит сообщение об этом.
-MAX_CONCURRENT_TASKS = 10
+MAX_CONCURRENT_TASKS = 25  # 50 пользователей / ~2 мин средняя очередь
 _generation_semaphore: asyncio.Semaphore | None = None  # инициализируется в on_startup
+_active_tasks: int = 0   # счётчик активных задач (без обращения к приватным атрибутам)
 
 # ── Retry-параметры ────────────────────────────────────────────────────────
 API_RETRY_ATTEMPTS = 3          # сколько раз повторять при ошибке API
@@ -72,9 +73,10 @@ db_pool: asyncpg.Pool | None = None
 # Инициализируем asyncio-объекты при старте бота
 @dp.startup()
 async def on_startup():
-    global _generation_semaphore, _key_lock, db_pool
+    global _generation_semaphore, _key_lock, db_pool, _active_tasks
     _generation_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
     _key_lock = asyncio.Lock()
+    _active_tasks = 0
 
     # Создаём пул asyncpg (min 2, max 10 соединений)
     db_pool = await asyncpg.create_pool(
@@ -646,6 +648,10 @@ async def generate_script(message: types.Message, state: FSMContext):
 
     templates = await get_templates()
     if message.text not in templates:
+        await message.answer(
+            "Выбери шаблон из списка:",
+            reply_markup=await get_dynamic_templates_kb(for_generation=True),
+        )
         return
 
     style_prompt  = templates[message.text]
@@ -659,14 +665,22 @@ async def generate_script(message: types.Message, state: FSMContext):
 
     file_name = f"script_{task_id.replace(' ', '_')}.txt"
 
+    # Защита от старта до инициализации (on_startup не отработал)
+    if _generation_semaphore is None:
+        await message.answer("❌ Бот ещё не готов, попробуй через несколько секунд.")
+        return
+
     # Если все слоты заняты — предупреждаем пользователя и ждём в очереди
-    if _generation_semaphore._value == 0:
+    if _active_tasks >= MAX_CONCURRENT_TASKS:
         await message.answer(
             "⏳ <b>Все слоты заняты.</b> Твоя задача поставлена в очередь — "
             "генерация начнётся автоматически, как только освободится место.",
             parse_mode="HTML",
         )
     await _generation_semaphore.acquire()
+
+    global _active_tasks
+    _active_tasks += 1
 
     try:
         # ── ФАЗА 0: уведомление ────────────────────────────────────────────
@@ -921,6 +935,7 @@ async def generate_script(message: types.Message, state: FSMContext):
 
     finally:
         # Гарантированно освобождаем слот очереди, очищаем state и файл
+        _active_tasks -= 1
         _generation_semaphore.release()
         await state.clear()
         if os.path.exists(file_name):
