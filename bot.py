@@ -346,6 +346,7 @@ def get_main_kb():
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="🎬 Создать сценарий")],
         [KeyboardButton(text="📁 Мои шаблоны"), KeyboardButton(text="⚙️ Настройки")],
+        [KeyboardButton(text="🔄 Перезапустить")],
     ], resize_keyboard=True)
 
 def get_models_kb():
@@ -378,7 +379,19 @@ async def start_cmd(message: types.Message, state: FSMContext):
         "👋 <b>Добро пожаловать в генератор сценариев!</b>\n\n"
         "Создавайте готовые сценарии без борьбы с лимитами и склеек.\n\n"
         "🎭 <b>Claude</b> — стиль.\n🧠 <b>ChatGPT</b> — логика.\n"
-        "⚡ <b>Gemini</b> — память.\n🔥 <b>Grok</b> — дерзость.\n🐲 <b>Qwen</b> — скорость."
+        "⚡ <b>Gemini</b> — скорость.\n🔥 <b>Grok</b> — дерзость."
+    )
+    await message.answer(text, reply_markup=get_main_kb(), parse_mode="HTML")
+
+
+@dp.message(F.text == "🔄 Перезапустить")
+async def restart_cmd(message: types.Message, state: FSMContext):
+    await state.clear()
+    text = (
+        "👋 <b>Добро пожаловать в генератор сценариев!</b>\n\n"
+        "Создавайте готовые сценарии без борьбы с лимитами и склеек.\n\n"
+        "🎭 <b>Claude</b> — стиль.\n🧠 <b>ChatGPT</b> — логика.\n"
+        "⚡ <b>Gemini</b> — скорость.\n🔥 <b>Grok</b> — дерзость."
     )
     await message.answer(text, reply_markup=get_main_kb(), parse_mode="HTML")
 
@@ -783,6 +796,16 @@ async def generate_script(message: types.Message, state: FSMContext):
 
         update_task_status(task_id, "Completed")
         os.remove(file_name)
+
+        # Кнопка быстрого перехода к новому сценарию
+        new_script_kb = ReplyKeyboardMarkup(keyboard=[
+            [KeyboardButton(text="🎬 Создать сценарий")],
+            [KeyboardButton(text="🔙 Назад в меню")],
+        ], resize_keyboard=True)
+        await message.answer(
+            "✅ Готово! Хочешь создать ещё один сценарий?",
+            reply_markup=new_script_kb,
+        )
 
     except Exception as e:
         logging.error(f"[{task_id}] Критическая ошибка: {e}")
