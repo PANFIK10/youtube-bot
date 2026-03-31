@@ -5,6 +5,7 @@ import os
 import re
 import asyncpg
 import random
+import string
 from datetime import datetime
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -24,8 +25,6 @@ import aiohttp
 TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN")
 DATABASE_URL       = os.getenv("DATABASE_URL")
 
-# ── Пул API-ключей OpenRouter ──────────────────────────────────────────────
-# Основной ключ + до 4 дополнительных. Берём все что есть в env.
 _raw_keys = [
     os.getenv("OPENROUTER_API_KEY"),
     os.getenv("OPENROUTER_API_KEY_1"),
@@ -33,131 +32,160 @@ _raw_keys = [
     os.getenv("OPENROUTER_API_KEY_3"),
     os.getenv("OPENROUTER_API_KEY_4"),
 ]
-API_KEYS: list[str] = [k for k in _raw_keys if k]   # убираем незаданные
+API_KEYS: list[str] = [k for k in _raw_keys if k]
 if not API_KEYS:
-    raise RuntimeError("Не задан ни один OPENROUTER_API_KEY в переменных окружения")
+    raise RuntimeError("Не задан ни один OPENROUTER_API_KEY")
 
-# Создаём отдельный AsyncOpenAI-клиент на каждый ключ
 _clients = [
     AsyncOpenAI(base_url="https://openrouter.ai/api/v1", api_key=key, timeout=120.0)
     for key in API_KEYS
 ]
-_key_index = 0          # курсор round-robin
-_key_lock  = None       # asyncio.Lock — инициализируется в on_startup
+_key_index = 0
+_key_lock  = None
 
 def _next_client() -> AsyncOpenAI:
-    """Round-robin по пулу клиентов. Потокобезопасно для asyncio."""
     global _key_index
     client = _clients[_key_index % len(_clients)]
     _key_index += 1
     return client
 
-# ── Семафор очереди ────────────────────────────────────────────────────────
-# Не более MAX_CONCURRENT_TASKS задач генерируются одновременно.
-# Остальные ждут в очереди — пользователь видит сообщение об этом.
-MAX_CONCURRENT_TASKS = 25  # 50 пользователей / ~2 мин средняя очередь
-_generation_semaphore: asyncio.Semaphore | None = None  # инициализируется в on_startup
-_active_tasks: int = 0   # счётчик активных задач (без обращения к приватным атрибутам)
+MAX_CONCURRENT_TASKS = 25
+_generation_semaphore: asyncio.Semaphore | None = None
+_active_tasks: int = 0
 
-# ── Retry-параметры ────────────────────────────────────────────────────────
-API_RETRY_ATTEMPTS = 3          # сколько раз повторять при ошибке API
-API_RETRY_BASE_DELAY = 2.0      # начальная пауза (сек), удваивается каждый раз
+API_RETRY_ATTEMPTS   = 3
+API_RETRY_BASE_DELAY = 2.0
 
 bot = Bot(token=TELEGRAM_TOKEN)
 dp  = Dispatcher()
 logging.basicConfig(level=logging.INFO)
 
-# Глобальный пул соединений asyncpg
 db_pool: asyncpg.Pool | None = None
 
-# Инициализируем asyncio-объекты при старте бота
 @dp.startup()
 async def on_startup():
     global _generation_semaphore, _key_lock, db_pool, _active_tasks
     _generation_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
     _key_lock = asyncio.Lock()
     _active_tasks = 0
-
-    # Создаём пул asyncpg (min 2, max 10 соединений)
-    db_pool = await asyncpg.create_pool(
-        DATABASE_URL,
-        min_size=2,
-        max_size=10,
-        ssl="prefer",
-    )
+    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10, ssl="prefer")
     await init_db()
-    logging.info(
-        f"БД: asyncpg пул готов | "
-        f"Ключей API: {len(API_KEYS)} | "
-        f"Очередь: max {MAX_CONCURRENT_TASKS} задач"
-    )
+    logging.info(f"Готов | API ключей: {len(API_KEYS)} | Очередь: {MAX_CONCURRENT_TASKS}")
 
 @dp.shutdown()
 async def on_shutdown():
     if db_pool:
         await db_pool.close()
-    logging.info("БД: пул соединений закрыт")
 
 # ---------------------------------------------------------------------------
 # КОНСТАНТЫ ГЕНЕРАЦИИ
 # ---------------------------------------------------------------------------
-WORDS_PER_MINUTE = 130          # темп речи при озвучке
-WORDS_PER_CHAPTER = 400         # целевой объём одной части (слов)
+WORDS_PER_MINUTE  = 130
+WORDS_PER_CHAPTER = 400
 
-# Каждая модель ведёт себя по-разному относительно запрошенного объёма.
-# Коэффициенты получены эмпирически из реальных прогонов:
-#   Haiku 4.5  — недодаёт ~7 %   → запрашиваем на 45 % больше  (1.35 / 0.931 = 1.45)
-#   GPT-5.1    — передаёт ~63 %  → запрашиваем на 17 % меньше  (1.35 / 1.633 = 0.83)
-#   Gemini     — передаёт ~8 %   → запрашиваем на 25 % больше  (1.35 / 1.079 = 1.25)
-#   Grok 4.1   — передаёт ~8 %   → запрашиваем на 25 % больше  (1.35 / 1.084 = 1.25)
 VOLUME_OVERREQUEST_FACTORS: dict[str, float] = {
-    "anthropic/claude-haiku-4.5":   1.45,
-    "openai/gpt-5.1":               0.83,
-    "google/gemini-2.5-flash-lite": 1.25,
-    "x-ai/grok-4.1-fast":           1.25,
+    "anthropic/claude-haiku-4.5":    1.45,
+    "anthropic/claude-sonnet-4.6":   1.30,
+    "openai/gpt-5.1":                0.83,
+    "google/gemini-2.5-flash-lite":  1.25,
+    "x-ai/grok-4.1-fast":            1.25,
 }
-VOLUME_OVERREQUEST_FACTOR_DEFAULT = 1.20  # запасной для неизвестных моделей
+VOLUME_OVERREQUEST_FACTOR_DEFAULT = 1.20
 
-# Если после генерации часть короче этого порога — она идёт на доработку
-MIN_CHAPTER_RATIO = 0.80        # 80 % от цели = допустимо
-MAX_REGEN_ATTEMPTS = 2          # максимум перегенераций одной части
-
-MAX_CTA_PER_SCRIPT = 5          # максимум призывов к комментариям на весь сценарий
-SECONDS_PER_CHUNK  = 18         # реальное время одной пачки из 5 параллельных запросов
+MIN_CHAPTER_RATIO  = 0.80
+MAX_REGEN_ATTEMPTS = 2
+MAX_CTA_PER_SCRIPT = 5
+SECONDS_PER_CHUNK  = 18
 
 MODEL_NAMES = {
-    "anthropic/claude-haiku-4.5":   "Claude",
-    "openai/gpt-5.1":               "ChatGPT",
-    "google/gemini-2.5-flash-lite": "Gemini",
-    "x-ai/grok-4.1-fast":           "Grok",
+    "anthropic/claude-haiku-4.5":    "Claude Haiku",
+    "anthropic/claude-sonnet-4.6":   "Claude Sonnet ✨",
+    "openai/gpt-5.1":                "ChatGPT",
+    "google/gemini-2.5-flash-lite":  "Gemini",
+    "x-ai/grok-4.1-fast":            "Grok",
 }
 
 # ---------------------------------------------------------------------------
-# РАБОТА С PostgreSQL (asyncpg)
+# МОНЕТИЗАЦИЯ
+# ---------------------------------------------------------------------------
+USD_TO_RUB = 86.0  # фиксированный курс
+
+# Цена в кредитах за минуту (1 кредит = 1 рубль)
+MODEL_PRICE_PER_MINUTE: dict[str, float] = {
+    "google/gemini-2.5-flash-lite":  0.15,
+    "x-ai/grok-4.1-fast":            0.25,
+    "anthropic/claude-haiku-4.5":    0.75,
+    "openai/gpt-5.1":                1.25,
+    "anthropic/claude-sonnet-4.6":   2.00,
+}
+
+WELCOME_CREDITS = 50  # стартовый бонус новому пользователю
+
+REFERRAL_BONUS_INVITER     = 25   # кредитов рефереру после первого пополнения приглашённого
+REFERRAL_BONUS_INVITEE_PCT = 10   # % бонуса приглашённому к первому пополнению
+
+# Пакеты: (цена ₽, базовых кредитов, бонус кредитов, название)
+CREDIT_PACKAGES = [
+    (99,   100,   0,   "Старт"),
+    (249,  250,   20,  "Базовый"),
+    (499,  500,   60,  "Продвинутый"),
+    (999,  1000,  200, "Профи"),
+    (1999, 2000,  600, "Макс"),
+]
+
+
+def calc_cost(model_id: str, duration_min: int) -> float:
+    """Стоимость генерации в кредитах, округление вверх до 0.5."""
+    price_per_min = MODEL_PRICE_PER_MINUTE.get(model_id, 1.0)
+    return math.ceil(price_per_min * duration_min * 2) / 2
+
+
+def _now() -> str:
+    return datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+
+
+def _gen_ref_code() -> str:
+    return "".join(random.choices(string.ascii_uppercase + string.digits, k=8))
+
+# ---------------------------------------------------------------------------
+# БАЗА ДАННЫХ
 # ---------------------------------------------------------------------------
 
 async def init_db():
     async with db_pool.acquire() as conn:
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS templates (
-                name TEXT PRIMARY KEY,
+                name   TEXT PRIMARY KEY,
                 prompt TEXT
             )
         """)
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS settings (
-                user_id BIGINT PRIMARY KEY,
-                model_name TEXT
+                user_id       BIGINT PRIMARY KEY,
+                model_name    TEXT,
+                credits       NUMERIC(12,2) DEFAULT 0,
+                referral_code TEXT UNIQUE,
+                referred_by   BIGINT,
+                first_topup   BOOLEAN DEFAULT FALSE
             )
         """)
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS tasks (
-                task_id TEXT PRIMARY KEY,
-                user_id BIGINT,
-                topic TEXT,
-                model TEXT,
-                status TEXT,
+                task_id    TEXT PRIMARY KEY,
+                user_id    BIGINT,
+                topic      TEXT,
+                model      TEXT,
+                status     TEXT,
                 created_at TEXT
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS transactions (
+                id          SERIAL PRIMARY KEY,
+                user_id     BIGINT,
+                amount      NUMERIC(12,2),
+                description TEXT,
+                created_at  TEXT
             )
         """)
         count = await conn.fetchval("SELECT COUNT(*) FROM templates")
@@ -168,48 +196,121 @@ async def init_db():
             )
 
 
+async def get_or_create_user(user_id: int) -> dict:
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM settings WHERE user_id=$1", user_id)
+        if row:
+            return dict(row)
+        ref_code = _gen_ref_code()
+        await conn.execute(
+            "INSERT INTO settings (user_id, model_name, credits, referral_code, referred_by, first_topup) "
+            "VALUES ($1,$2,$3,$4,NULL,FALSE)",
+            user_id, "x-ai/grok-4.1-fast", WELCOME_CREDITS, ref_code,
+        )
+        await conn.execute(
+            "INSERT INTO transactions (user_id, amount, description, created_at) VALUES ($1,$2,$3,$4)",
+            user_id, WELCOME_CREDITS, "🎁 Стартовый бонус", _now(),
+        )
+        return dict(await conn.fetchrow("SELECT * FROM settings WHERE user_id=$1", user_id))
+
+
+async def get_balance(user_id: int) -> float:
+    user = await get_or_create_user(user_id)
+    return float(user["credits"])
+
+
+async def add_credits(user_id: int, amount: float, description: str):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE settings SET credits = credits + $1 WHERE user_id=$2", amount, user_id,
+        )
+        await conn.execute(
+            "INSERT INTO transactions (user_id, amount, description, created_at) VALUES ($1,$2,$3,$4)",
+            user_id, amount, description, _now(),
+        )
+
+
+async def deduct_credits(user_id: int, amount: float, description: str):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE settings SET credits = credits - $1 WHERE user_id=$2", amount, user_id,
+        )
+        await conn.execute(
+            "INSERT INTO transactions (user_id, amount, description, created_at) VALUES ($1,$2,$3,$4)",
+            user_id, -amount, description, _now(),
+        )
+
+
+async def get_transactions(user_id: int, limit: int = 7) -> list:
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT amount, description, created_at FROM transactions "
+            "WHERE user_id=$1 ORDER BY id DESC LIMIT $2",
+            user_id, limit,
+        )
+    return [dict(r) for r in rows]
+
+
+async def apply_referral(new_user_id: int, ref_code: str) -> bool:
+    async with db_pool.acquire() as conn:
+        referrer = await conn.fetchrow("SELECT user_id FROM settings WHERE referral_code=$1", ref_code)
+        if not referrer or referrer["user_id"] == new_user_id:
+            return False
+        row = await conn.fetchrow("SELECT referred_by FROM settings WHERE user_id=$1", new_user_id)
+        if row and row["referred_by"] is not None:
+            return False
+        await conn.execute(
+            "UPDATE settings SET referred_by=$1 WHERE user_id=$2", referrer["user_id"], new_user_id,
+        )
+    return True
+
+
+async def process_first_topup(user_id: int, topup_amount: float):
+    """Начисляет реферальные бонусы при первом пополнении."""
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT referred_by, first_topup FROM settings WHERE user_id=$1", user_id,
+        )
+        if not row or row["first_topup"]:
+            return
+        await conn.execute("UPDATE settings SET first_topup=TRUE WHERE user_id=$1", user_id)
+        referrer_id = row["referred_by"]
+
+    bonus_invitee = round(topup_amount * REFERRAL_BONUS_INVITEE_PCT / 100, 2)
+    if bonus_invitee > 0:
+        await add_credits(user_id, bonus_invitee, f"🎁 Реферальный бонус +{REFERRAL_BONUS_INVITEE_PCT}%")
+    if referrer_id:
+        await add_credits(referrer_id, REFERRAL_BONUS_INVITER, "👥 Бонус за приглашённого")
+        logging.info(f"Реф. бонус {REFERRAL_BONUS_INVITER} кред. → user {referrer_id}")
+
+
 async def log_task(task_id, user_id, topic, model):
-    now = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
     async with db_pool.acquire() as conn:
         await conn.execute(
             "INSERT INTO tasks VALUES ($1,$2,$3,$4,$5,$6)",
-            task_id, user_id, topic, model, "In Progress", now,
+            task_id, user_id, topic, model, "In Progress", _now(),
         )
 
 
 async def update_task_status(task_id, status):
     async with db_pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE tasks SET status=$1 WHERE task_id=$2",
-            status, task_id,
-        )
+        await conn.execute("UPDATE tasks SET status=$1 WHERE task_id=$2", status, task_id)
 
 
 async def get_task_status(task_id) -> str | None:
     async with db_pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT status FROM tasks WHERE task_id=$1", task_id
-        )
+        row = await conn.fetchrow("SELECT status FROM tasks WHERE task_id=$1", task_id)
     return row["status"] if row else None
 
 
 async def get_user_model(user_id) -> str:
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT model_name FROM settings WHERE user_id=$1", user_id
-        )
-    return row["model_name"] if row else "x-ai/grok-4.1-fast"
+    user = await get_or_create_user(user_id)
+    return user["model_name"] or "x-ai/grok-4.1-fast"
 
 
 async def set_user_model(user_id, model_name):
     async with db_pool.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO settings (user_id, model_name) VALUES ($1, $2)
-            ON CONFLICT (user_id) DO UPDATE SET model_name = EXCLUDED.model_name
-            """,
-            user_id, model_name,
-        )
+        await conn.execute("UPDATE settings SET model_name=$1 WHERE user_id=$2", model_name, user_id)
 
 
 async def get_templates() -> dict:
@@ -221,10 +322,8 @@ async def get_templates() -> dict:
 async def add_template(name, prompt):
     async with db_pool.acquire() as conn:
         await conn.execute(
-            """
-            INSERT INTO templates (name, prompt) VALUES ($1, $2)
-            ON CONFLICT (name) DO UPDATE SET prompt = EXCLUDED.prompt
-            """,
+            "INSERT INTO templates (name,prompt) VALUES ($1,$2) "
+            "ON CONFLICT (name) DO UPDATE SET prompt=EXCLUDED.prompt",
             name, prompt,
         )
 
@@ -233,137 +332,83 @@ async def delete_template(name):
     async with db_pool.acquire() as conn:
         await conn.execute("DELETE FROM templates WHERE name=$1", name)
 
-
 # ---------------------------------------------------------------------------
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ---------------------------------------------------------------------------
 
 async def api_call_with_retry(model_id: str, messages: list, max_tokens: int) -> str:
-    """
-    Вызов OpenRouter с автоматическим retry и ротацией ключей.
-    При ошибке rate-limit или сетевой ошибке — ждёт и пробует следующий ключ.
-    Возвращает текст ответа или бросает исключение после всех попыток.
-    """
     last_exc = None
     for attempt in range(API_RETRY_ATTEMPTS):
         async with _key_lock:
             c = _next_client()
         try:
             resp = await c.chat.completions.create(
-                model=model_id,
-                messages=messages,
-                max_tokens=max_tokens,
+                model=model_id, messages=messages, max_tokens=max_tokens,
             )
             return resp.choices[0].message.content
         except Exception as e:
             last_exc = e
             err_str = str(e).lower()
-            # Rate limit или сервер перегружен — ждём с экспоненциальной задержкой
             if any(x in err_str for x in ("rate", "429", "502", "503", "timeout")):
                 delay = API_RETRY_BASE_DELAY * (2 ** attempt)
-                logging.warning(
-                    f"API ошибка (попытка {attempt+1}/{API_RETRY_ATTEMPTS}): {e} "
-                    f"— повтор через {delay:.1f}с"
-                )
+                logging.warning(f"API retry {attempt+1}/{API_RETRY_ATTEMPTS}: {delay:.1f}с")
                 await asyncio.sleep(delay)
             else:
-                # Не сетевая ошибка — сразу бросаем
                 raise
     raise last_exc
 
 
 def clean_chapter_text(text: str) -> str:
-    """
-    Удаляет все технические артефакты форматирования из текста части:
-    заголовки Markdown, горизонтальные разделители, слова «Глава/Часть/Раздел»,
-    жирный/курсивный текст на отдельных строках, лишние переносы.
-    """
-    # Горизонтальные разделители: ---, ***, ___, ===, ~~~
     text = re.sub(r'^[-*_=~]{3,}\s*$', '', text, flags=re.MULTILINE)
-    # Markdown-заголовки: # ## ###
     text = re.sub(r'^#{1,6}\s+.*$', '', text, flags=re.MULTILINE)
-    # «Глава 1», «Часть II», «Раздел 3:», «Chapter One», «Part 2» и т.п.
     text = re.sub(
-        r'^(Глава|Часть|Раздел|Блок|Chapter|Part|Section)\s*[\dIVXivxабвгАБВГ]*'
-        r'[.:\-–—)]*\s*.*$',
+        r'^(Глава|Часть|Раздел|Блок|Chapter|Part|Section)\s*[\dIVXivxабвгАБВГ]*[.:\-–—)]*\s*.*$',
         '', text, flags=re.MULTILINE | re.IGNORECASE,
     )
-    # Строки из одного **жирного** блока
     text = re.sub(r'^\*\*[^*\n]+\*\*\s*$', '', text, flags=re.MULTILINE)
-    # Строки из одного *курсивного* блока
-    text = re.sub(r'^\*[^*\n]+\*\s*$', '', text, flags=re.MULTILINE)
-    # Строки из одного __подчёркнутого__ блока
-    text = re.sub(r'^__[^_\n]+__\s*$', '', text, flags=re.MULTILINE)
-    # Строки-отчёты модели: «Проверка: 540 слов ✓», «Итого: 512 слов», «Слов: 498» и т.п.
+    text = re.sub(r'^\*[^*\n]+\*\s*$',     '', text, flags=re.MULTILINE)
+    text = re.sub(r'^__[^_\n]+__\s*$',      '', text, flags=re.MULTILINE)
     text = re.sub(
         r'^\*{0,2}(Проверка|Итого|Подсчёт|Слов|Всего|Объём|Word count|Total)[^\n]{0,60}$',
         '', text, flags=re.MULTILINE | re.IGNORECASE,
     )
-    # Строки вида «(540 слов)», «[512 words]» — скобочные аннотации объёма
     text = re.sub(r'^\[?\(?\d{2,4}\s*(слов|words|сл\.)\)?\]?\s*$', '', text, flags=re.MULTILINE)
-    # Тройные и более переносы → двойной
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
 
 
 def parse_plan_chapters(plan_text: str, target_count: int) -> list[str]:
-    """
-    Парсит нумерованный план → список чистых названий глав.
-    Обрезает до target_count, если модель вернула больше.
-    """
     lines = []
     for line in plan_text.splitlines():
         line = line.strip()
         if not line or len(line) < 4:
             continue
-        line = re.sub(r'^[\d]+[.)]\s+', '', line)   # «1. » / «1) »
-        line = re.sub(r'^[-–—•*]\s+', '', line)      # «- » / «• »
+        line = re.sub(r'^[\d]+[.)]\s+', '', line)
+        line = re.sub(r'^[-–—•*]\s+',   '', line)
         line = line.strip()
         if len(line) > 3:
             lines.append(line)
-
     if not lines:
-        logging.warning("План пустой — использую заглушки")
-        return [f"Часть {i + 1}" for i in range(target_count)]
-
+        return [f"Часть {i+1}" for i in range(target_count)]
     if len(lines) > target_count:
         lines = lines[:target_count]
-    elif len(lines) < target_count:
-        logging.warning(f"План вернул {len(lines)} из {target_count} глав")
-
     return lines
 
 
 def compute_cta_positions(total_chapters: int, max_cta: int = MAX_CTA_PER_SCRIPT) -> set[int]:
-    """
-    Равномерно распределяет позиции CTA по сценарию.
-    Никогда не ставит CTA в первую главу.
-    Возвращает множество индексов (0-based).
-    """
     if total_chapters <= 1:
         return set()
-    # Делим диапазон [1 .. total-1] на max_cta равных отрезков
     count = min(max_cta, total_chapters - 1)
     step  = (total_chapters - 1) / count
     return {round(1 + step * i) for i in range(count)}
 
 
-def build_progress_text(
-    task_id: str,
-    friendly_model: str,
-    total_chapters: int,
-    done_chapters: int,
-    remaining_chunks: int,
-    phase: str = "generate",   # "generate" | "regen" | "done"
-) -> str:
-    """
-    Формирует HTML-текст статусного сообщения с прогресс-баром.
-    Редактируется после каждой пачки.
-    """
-    bar_len   = 10
-    filled    = round(bar_len * done_chapters / max(total_chapters, 1))
-    bar       = "▓" * filled + "░" * (bar_len - filled)
-    pct       = round(100 * done_chapters / max(total_chapters, 1))
+def build_progress_text(task_id, friendly_model, total_chapters,
+                        done_chapters, remaining_chunks, phase="generate"):
+    bar_len = 10
+    filled  = round(bar_len * done_chapters / max(total_chapters, 1))
+    bar     = "▓" * filled + "░" * (bar_len - filled)
+    pct     = round(100 * done_chapters / max(total_chapters, 1))
 
     if phase == "regen":
         status_line = "🔧 <i>Доработка коротких частей...</i>"
@@ -386,29 +431,24 @@ def build_progress_text(
 
 
 async def safe_edit(msg: types.Message, text: str, reply_markup=None):
-    """
-    Безопасное редактирование сообщения.
-    Передаём reply_markup при каждом edit — иначе Telegram сбрасывает кнопки.
-    Игнорирует «message is not modified» и другие мелкие ошибки.
-    """
     try:
         await msg.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
     except TelegramBadRequest as e:
         if "message is not modified" not in str(e):
-            logging.warning(f"edit_text error: {e}")
+            logging.warning(f"edit_text: {e}")
     except Exception as e:
-        logging.warning(f"safe_edit failed: {e}")
+        logging.warning(f"safe_edit: {e}")
 
 
 async def upload_to_backup(file_path: str) -> str | None:
     try:
         async with aiohttp.ClientSession() as session:
-            with open(file_path, 'rb') as f:
-                async with session.post('https://file.io/?expires=14d', data={'file': f}) as resp:
+            with open(file_path, "rb") as f:
+                async with session.post("https://file.io/?expires=14d", data={"file": f}) as resp:
                     res = await resp.json()
-                    return res.get('link')
+                    return res.get("link")
     except Exception as e:
-        logging.error(f"Ошибка бэкапа: {e}")
+        logging.error(f"Бэкап: {e}")
         return None
 
 # ---------------------------------------------------------------------------
@@ -420,8 +460,8 @@ class ScriptMaker(StatesGroup):
     waiting_for_template = State()
 
 class TemplateManager(StatesGroup):
-    waiting_for_new_name   = State()
-    waiting_for_new_prompt = State()
+    waiting_for_new_name    = State()
+    waiting_for_new_prompt  = State()
     waiting_for_delete_name = State()
 
 # ---------------------------------------------------------------------------
@@ -430,14 +470,18 @@ class TemplateManager(StatesGroup):
 def get_main_kb():
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="🎬 Создать сценарий")],
-        [KeyboardButton(text="📁 Мои шаблоны"), KeyboardButton(text="⚙️ Настройки")],
+        [KeyboardButton(text="💰 Баланс"),   KeyboardButton(text="💳 Пополнить")],
+        [KeyboardButton(text="📋 Тарифы"),   KeyboardButton(text="📦 Пакеты")],
+        [KeyboardButton(text="📁 Шаблоны"),  KeyboardButton(text="⚙️ Настройки")],
+        [KeyboardButton(text="👥 Реферальная программа")],
         [KeyboardButton(text="🔄 Перезапустить")],
     ], resize_keyboard=True)
 
 def get_models_kb():
     return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="Claude"),  KeyboardButton(text="ChatGPT")],
-        [KeyboardButton(text="Gemini"),  KeyboardButton(text="Grok")],
+        [KeyboardButton(text="Gemini"),         KeyboardButton(text="Grok")],
+        [KeyboardButton(text="Claude Haiku"),   KeyboardButton(text="ChatGPT")],
+        [KeyboardButton(text="Claude Sonnet ✨")],
         [KeyboardButton(text="🔙 Назад в меню")],
     ], resize_keyboard=True)
 
@@ -448,10 +492,6 @@ def get_templates_menu_kb():
     ], resize_keyboard=True)
 
 async def get_dynamic_templates_kb(for_generation: bool = False):
-    """
-    for_generation=True  — выбор шаблона при создании сценария (без кнопки «Создать новый»)
-    for_generation=False — управление шаблонами (с кнопкой «Создать новый»)
-    """
     templates = await get_templates()
     kb = [[KeyboardButton(text=name)] for name in templates]
     if not for_generation:
@@ -460,25 +500,114 @@ async def get_dynamic_templates_kb(for_generation: bool = False):
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
 # ---------------------------------------------------------------------------
-# ХЭНДЛЕРЫ — навигация
+# ТЕКСТЫ
 # ---------------------------------------------------------------------------
 WELCOME_TEXT = (
     "👋 <b>Добро пожаловать в генератор сценариев!</b>\n\n"
-    "Создавайте готовые сценарии без борьбы с лимитами и склеек.\n\n"
-    "🎭 <b>Claude</b> — стиль.\n🧠 <b>ChatGPT</b> — логика.\n"
-    "⚡ <b>Gemini</b> — скорость.\n🔥 <b>Grok</b> — дерзость."
+    "Создавайте готовые YouTube-сценарии без ограничений.\n\n"
+    "🟢 <b>Gemini</b> — бюджет\n"
+    "🔵 <b>Grok</b> — дерзость\n"
+    "🟡 <b>Claude Haiku</b> — стиль\n"
+    "🟠 <b>ChatGPT</b> — логика\n"
+    "🔴 <b>Claude Sonnet ✨</b> — элита\n\n"
+    f"🎁 Вам начислено <b>{WELCOME_CREDITS} стартовых кредитов</b>!"
 )
+
+TARIFFS_TEXT = (
+    "💰 <b>Тарифы на генерацию</b>\n\n"
+    "Стоимость = <b>цена за минуту × длительность</b>\n"
+    "1 кредит = 1 рубль\n\n"
+    "──────────────────────────\n"
+    "🟢 <b>Gemini</b> — 0.15 кред./мин\n"
+    "30 мин: 4.5₽  |  60 мин: 9₽  |  90 мин: 13.5₽  |  120 мин: 18₽\n\n"
+    "🔵 <b>Grok</b> — 0.25 кред./мин\n"
+    "30 мин: 7.5₽  |  60 мин: 15₽  |  90 мин: 22.5₽  |  120 мин: 30₽\n\n"
+    "🟡 <b>Claude Haiku</b> — 0.75 кред./мин\n"
+    "30 мин: 22.5₽  |  60 мин: 45₽  |  90 мин: 67.5₽  |  120 мин: 90₽\n\n"
+    "🟠 <b>ChatGPT (GPT-5.1)</b> — 1.25 кред./мин\n"
+    "30 мин: 37.5₽  |  60 мин: 75₽  |  90 мин: 112.5₽  |  120 мин: 150₽\n\n"
+    "🔴 <b>Claude Sonnet ✨</b> — 2.00 кред./мин\n"
+    "30 мин: 60₽  |  60 мин: 120₽  |  90 мин: 180₽  |  120 мин: 240₽\n"
+    "──────────────────────────\n\n"
+    "<i>Стоимость показывается перед каждой генерацией.\n"
+    "Кредиты списываются только после успешного завершения.\n"
+    "Если баланса не хватает — генерация не начнётся.</i>"
+)
+
+
+def build_packages_text() -> str:
+    lines = ["📦 <b>Пакеты пополнения</b>\n\n"
+             "Покупай выгоднее — чем больше пакет, тем ниже цена за кредит.\n\n"]
+
+    for price, base, bonus, name in CREDIT_PACKAGES:
+        total = base + bonus
+        discount = round((1 - price / total) * 100) if total > price else 0
+        discount_str = f" (<b>скидка {discount}%</b>)" if discount else ""
+        bonus_str    = f" + {bonus} бонус" if bonus else ""
+
+        # Примеры на что хватит
+        examples = []
+        for mid, ppm in MODEL_PRICE_PER_MINUTE.items():
+            mname = MODEL_NAMES[mid].replace(" ✨", "")
+            for mins in [120, 60, 30]:
+                cost_one = ppm * mins
+                if cost_one <= total:
+                    n = int(total // cost_one)
+                    examples.append(f"{mname}: {n}× {mins} мин.")
+                    break
+
+        lines.append(
+            f"──────────────────────────\n"
+            f"<b>{name}</b> — {price}₽{discount_str}\n"
+            f"💳 {base}{bonus_str} = <b>{total} кредитов</b>\n"
+            f"<i>Например:</i>\n"
+        )
+        for ex in examples[:3]:
+            lines.append(f"  • {ex}\n")
+        lines.append("\n")
+
+    lines.append(
+        "──────────────────────────\n"
+        "<i>Для оплаты нажми «💳 Пополнить»</i>"
+    )
+    return "".join(lines)
+
+# ---------------------------------------------------------------------------
+# НАВИГАЦИЯ
+# ---------------------------------------------------------------------------
 
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message, state: FSMContext):
     await state.clear()
-    await message.answer(WELCOME_TEXT, reply_markup=get_main_kb(), parse_mode="HTML")
+    user_id = message.from_user.id
+    args    = message.text.split()
+    user    = await get_or_create_user(user_id)
+
+    # Реферальный код в параметре /start
+    if len(args) > 1:
+        applied = await apply_referral(user_id, args[1])
+        if applied:
+            await message.answer(
+                "✅ Реферальная ссылка применена!\n"
+                f"Вы получите бонус +{REFERRAL_BONUS_INVITEE_PCT}% к первому пополнению.",
+                parse_mode="HTML",
+            )
+
+    balance = float(user["credits"])
+    await message.answer(
+        WELCOME_TEXT + f"\n\n💰 Ваш баланс: <b>{balance:.1f} кредитов</b>",
+        reply_markup=get_main_kb(), parse_mode="HTML",
+    )
 
 
 @dp.message(F.text == "🔄 Перезапустить")
 async def restart_cmd(message: types.Message, state: FSMContext):
     await state.clear()
-    await message.answer(WELCOME_TEXT, reply_markup=get_main_kb(), parse_mode="HTML")
+    balance = await get_balance(message.from_user.id)
+    await message.answer(
+        WELCOME_TEXT + f"\n\n💰 Ваш баланс: <b>{balance:.1f} кредитов</b>",
+        reply_markup=get_main_kb(), parse_mode="HTML",
+    )
 
 
 @dp.message(F.text == "🔙 Назад в меню")
@@ -486,13 +615,111 @@ async def back_to_main(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer("Главное меню:", reply_markup=get_main_kb())
 
+# ---------------------------------------------------------------------------
+# БАЛАНС
+# ---------------------------------------------------------------------------
+
+@dp.message(Command("balance"))
+@dp.message(F.text == "💰 Баланс")
+async def balance_cmd(message: types.Message):
+    user_id = message.from_user.id
+    balance = await get_balance(user_id)
+    txs     = await get_transactions(user_id, limit=7)
+    user    = await get_or_create_user(user_id)
+
+    text = f"💰 <b>Баланс: {balance:.1f} кредитов</b>\n\n📋 <b>Последние операции:</b>\n"
+    for tx in txs:
+        sign = "+" if tx["amount"] > 0 else ""
+        text += f"  {sign}{tx['amount']:.1f} — {tx['description']} <i>({tx['created_at']})</i>\n"
+    if not txs:
+        text += "  <i>Операций нет</i>\n"
+
+    text += f"\n🔗 Реферальный код: <code>{user['referral_code']}</code>"
+    await message.answer(text, parse_mode="HTML")
+
+# ---------------------------------------------------------------------------
+# ПОПОЛНЕНИЕ
+# ---------------------------------------------------------------------------
+
+@dp.message(F.text == "💳 Пополнить")
+async def topup_cmd(message: types.Message):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=f"{name} — {price}₽  →  {base+bonus} кред.",
+            callback_data=f"pkg_{i}",
+        )]
+        for i, (price, base, bonus, name) in enumerate(CREDIT_PACKAGES)
+    ])
+    await message.answer(
+        "💳 <b>Выберите пакет пополнения:</b>\n\n"
+        "<i>Платёжная система подключается — скоро будет автоплатёж.\n"
+        "Пока свяжитесь с поддержкой для ручного пополнения.</i>",
+        reply_markup=kb, parse_mode="HTML",
+    )
+
+
+@dp.callback_query(F.data.startswith("pkg_"))
+async def pkg_selected(call: types.CallbackQuery):
+    idx = int(call.data.split("_")[1])
+    price, base, bonus, name = CREDIT_PACKAGES[idx]
+    total = base + bonus
+    await call.message.answer(
+        f"📦 Пакет <b>{name}</b>\n"
+        f"💳 Сумма: <b>{price}₽</b>\n"
+        f"🎁 Получите: <b>{total} кредитов</b>\n\n"
+        f"Для оплаты напишите в поддержку с указанием:\n"
+        f"• Пакет: <b>{name}</b>\n"
+        f"• Ваш ID: <code>{call.from_user.id}</code>",
+        parse_mode="HTML",
+    )
+    await call.answer()
+
+# ---------------------------------------------------------------------------
+# ТАРИФЫ И ПАКЕТЫ
+# ---------------------------------------------------------------------------
+
+@dp.message(F.text == "📋 Тарифы")
+async def tariffs_cmd(message: types.Message):
+    await message.answer(TARIFFS_TEXT, parse_mode="HTML")
+
+
+@dp.message(F.text == "📦 Пакеты")
+async def packages_cmd(message: types.Message):
+    await message.answer(build_packages_text(), parse_mode="HTML")
+
+# ---------------------------------------------------------------------------
+# РЕФЕРАЛЬНАЯ ПРОГРАММА
+# ---------------------------------------------------------------------------
+
+@dp.message(F.text == "👥 Реферальная программа")
+async def referral_cmd(message: types.Message):
+    user     = await get_or_create_user(message.from_user.id)
+    bot_info = await bot.get_me()
+    ref_link = f"https://t.me/{bot_info.username}?start={user['referral_code']}"
+
+    await message.answer(
+        "👥 <b>Реферальная программа</b>\n\n"
+        "Приглашайте друзей и получайте бонусы!\n\n"
+        f"🔗 Ваша ссылка:\n<code>{ref_link}</code>\n\n"
+        "<b>Условия:</b>\n"
+        f"• Вы получаете <b>{REFERRAL_BONUS_INVITER} кредитов</b> "
+        f"когда приглашённый делает первое пополнение\n"
+        f"• Приглашённый получает <b>+{REFERRAL_BONUS_INVITEE_PCT}%</b> "
+        f"бонусных кредитов к первому пополнению\n\n"
+        "<i>Бонус начисляется автоматически.</i>",
+        parse_mode="HTML",
+    )
+
+# ---------------------------------------------------------------------------
+# НАСТРОЙКИ
+# ---------------------------------------------------------------------------
 
 @dp.message(F.text == "⚙️ Настройки")
 async def settings_menu(message: types.Message):
-    cur = await get_user_model(message.from_user.id)
+    cur      = await get_user_model(message.from_user.id)
     friendly = MODEL_NAMES.get(cur, cur)
     await message.answer(
-        f"⚙️ <b>Настройки интеллекта</b>\n\nТекущая модель: <b>{friendly}</b>",
+        f"⚙️ <b>Настройки</b>\n\nТекущая модель: <b>{friendly}</b>",
         reply_markup=get_models_kb(), parse_mode="HTML",
     )
 
@@ -507,9 +734,10 @@ async def change_model(message: types.Message):
     )
 
 # ---------------------------------------------------------------------------
-# ХЭНДЛЕРЫ — шаблоны
+# ШАБЛОНЫ
 # ---------------------------------------------------------------------------
-@dp.message(F.text == "📁 Мои шаблоны")
+
+@dp.message(F.text == "📁 Шаблоны")
 async def templates_menu(message: types.Message):
     templates = await get_templates()
     text = "📂 <b>Твои шаблоны:</b>\n\n"
@@ -523,13 +751,13 @@ async def templates_menu(message: types.Message):
 
 @dp.message(F.text == "➕ Добавить шаблон")
 async def add_template_start(message: types.Message, state: FSMContext):
-    await message.answer("Введи название нового шаблона:", reply_markup=types.ReplyKeyboardRemove())
+    await message.answer("Введи название:", reply_markup=types.ReplyKeyboardRemove())
     await state.set_state(TemplateManager.waiting_for_new_name)
 
 
 @dp.message(F.text == "✏️ Изменить шаблон")
 async def edit_template_start(message: types.Message, state: FSMContext):
-    await message.answer("Какой шаблон хочешь изменить?", reply_markup=await get_dynamic_templates_kb())
+    await message.answer("Какой изменить?", reply_markup=await get_dynamic_templates_kb())
     await state.set_state(TemplateManager.waiting_for_new_name)
 
 
@@ -538,27 +766,23 @@ async def add_template_name(message: types.Message, state: FSMContext):
     if message.text == "🔙 Назад в меню":
         return await back_to_main(message, state)
     await state.update_data(template_name=message.text)
-    await message.answer(
-        "Отправь новый текст промпта для этого шаблона:",
-        reply_markup=types.ReplyKeyboardRemove(),
-    )
+    await message.answer("Отправь текст промпта:", reply_markup=types.ReplyKeyboardRemove())
     await state.set_state(TemplateManager.waiting_for_new_prompt)
 
 
 @dp.message(TemplateManager.waiting_for_new_prompt)
 async def add_template_prompt(message: types.Message, state: FSMContext):
     data = await state.get_data()
-    await add_template(data['template_name'], message.text)
-    if 'topic' in data:
+    await add_template(data["template_name"], message.text)
+    if "topic" in data:
         await message.answer(
             f"✅ Шаблон <b>{data['template_name']}</b> сохранён!\n"
-            f"Продолжаем работу над сценарием: <i>{data['topic']}</i>.\n\n"
-            "Выберите шаблон для генерации:",
+            f"Продолжаем: <i>{data['topic']}</i>. Выберите шаблон:",
             reply_markup=await get_dynamic_templates_kb(for_generation=True), parse_mode="HTML",
         )
         await state.set_state(ScriptMaker.waiting_for_template)
     else:
-        await message.answer("✅ Шаблон успешно сохранён!", reply_markup=get_main_kb())
+        await message.answer("✅ Сохранён!", reply_markup=get_main_kb())
         await state.clear()
 
 
@@ -576,6 +800,9 @@ async def delete_template_confirm(message: types.Message, state: FSMContext):
     await message.answer(f"🗑 Удалено: {message.text}", reply_markup=get_templates_menu_kb())
     await state.clear()
 
+# ---------------------------------------------------------------------------
+# ОТМЕНА
+# ---------------------------------------------------------------------------
 
 @dp.callback_query(F.data.startswith("cancel_"))
 async def cancel_task_handler(call: types.CallbackQuery):
@@ -588,20 +815,19 @@ async def cancel_task_handler(call: types.CallbackQuery):
         )
     except Exception:
         pass
-    # Показываем клавиатуру для быстрого старта нового сценария
-    new_script_kb = ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="🎬 Создать сценарий")],
-        [KeyboardButton(text="🔙 Назад в меню")],
-    ], resize_keyboard=True)
     await call.message.answer(
         "Хочешь создать новый сценарий?",
-        reply_markup=new_script_kb,
+        reply_markup=ReplyKeyboardMarkup(keyboard=[
+            [KeyboardButton(text="🎬 Создать сценарий")],
+            [KeyboardButton(text="🔙 Назад в меню")],
+        ], resize_keyboard=True),
     )
     await call.answer()
 
 # ---------------------------------------------------------------------------
-# ХЭНДЛЕРЫ — создание сценария
+# СОЗДАНИЕ СЦЕНАРИЯ
 # ---------------------------------------------------------------------------
+
 @dp.message(F.text == "🎬 Создать сценарий")
 async def start_script(message: types.Message, state: FSMContext):
     await message.answer("О чём видео?", reply_markup=types.ReplyKeyboardRemove())
@@ -618,150 +844,144 @@ async def process_topic(message: types.Message, state: FSMContext):
 @dp.message(ScriptMaker.waiting_for_duration)
 async def process_duration(message: types.Message, state: FSMContext):
     if not message.text.isdigit() or int(message.text) < 1:
-        await message.answer("⚠️ Введите длительность числом, например: <b>60</b>", parse_mode="HTML")
+        await message.answer("⚠️ Введите число, например: <b>60</b>", parse_mode="HTML")
         return
-    duration = int(message.text)
+
+    duration    = int(message.text)
+    model_id    = await get_user_model(message.from_user.id)
+    cost        = calc_cost(model_id, duration)
+    balance     = await get_balance(message.from_user.id)
+    model_name  = MODEL_NAMES.get(model_id, model_id)
+
     await state.update_data(duration=duration, words_target=duration * WORDS_PER_MINUTE)
+
+    cost_line = (
+        f"<i>💰 Стоимость ({model_name}, {duration} мин): "
+        f"<b>{cost:.1f} кред.</b> | Баланс: <b>{balance:.1f} кред.</b></i>\n\n"
+    )
+
+    if balance < cost:
+        await message.answer(
+            f"❌ <b>Недостаточно кредитов</b>\n\n{cost_line}"
+            "Нажми <b>💳 Пополнить</b> чтобы пополнить баланс.",
+            reply_markup=get_main_kb(), parse_mode="HTML",
+        )
+        await state.clear()
+        return
+
     await message.answer(
-        "<i>⚠️ Обратите внимание: итоговый хронометраж может отличаться на ±10 минут, "
-        "так как скорость речи и паузы при озвучке у всех индивидуальны.</i>\n\n"
-        "Выбери шаблон:",
+        f"{cost_line}"
+        "<i>⚠️ Хронометраж может отличаться на ±10 мин.</i>\n\nВыбери шаблон:",
         reply_markup=await get_dynamic_templates_kb(for_generation=True), parse_mode="HTML",
     )
     await state.set_state(ScriptMaker.waiting_for_template)
 
+# ---------------------------------------------------------------------------
+# ГЕНЕРАЦИЯ
+# ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# ГЛАВНАЯ ФУНКЦИЯ ГЕНЕРАЦИИ
-# ---------------------------------------------------------------------------
 @dp.message(ScriptMaker.waiting_for_template)
 async def generate_script(message: types.Message, state: FSMContext):
     global _active_tasks
+
     if message.text == "🔙 Назад в меню":
         return await back_to_main(message, state)
     if message.text == "➕ Создать новый шаблон":
-        await message.answer(
-            "Введите название для нового шаблона:",
-            reply_markup=types.ReplyKeyboardRemove(),
-        )
+        await message.answer("Введите название:", reply_markup=types.ReplyKeyboardRemove())
         await state.set_state(TemplateManager.waiting_for_new_name)
         return
 
     templates = await get_templates()
     if message.text not in templates:
         await message.answer(
-            "Выбери шаблон из списка:",
+            "Выбери из списка:",
             reply_markup=await get_dynamic_templates_kb(for_generation=True),
         )
         return
 
-    style_prompt  = templates[message.text]
-    data          = await state.get_data()
-    model_id      = await get_user_model(message.from_user.id)
+    style_prompt   = templates[message.text]
+    data           = await state.get_data()
+    model_id       = await get_user_model(message.from_user.id)
     friendly_model = MODEL_NAMES.get(model_id, "AI")
-    words_target  = data['words_target']
+    words_target   = data["words_target"]
+    duration       = data["duration"]
+    user_id        = message.from_user.id
 
-    task_id = f"{random.randint(100,999)} {random.randint(100,999)} {random.randint(100,999)}"
-    await log_task(task_id, message.from_user.id, data['topic'], friendly_model)
+    # Финальная проверка баланса
+    cost    = calc_cost(model_id, duration)
+    balance = await get_balance(user_id)
+    if balance < cost:
+        await message.answer(
+            f"❌ <b>Недостаточно кредитов</b>\n"
+            f"Нужно: <b>{cost:.1f}</b> | Баланс: <b>{balance:.1f}</b>",
+            reply_markup=get_main_kb(), parse_mode="HTML",
+        )
+        await state.clear()
+        return
 
+    task_id   = f"{random.randint(100,999)} {random.randint(100,999)} {random.randint(100,999)}"
     file_name = f"script_{task_id.replace(' ', '_')}.txt"
+    await log_task(task_id, user_id, data["topic"], friendly_model)
 
-    # Защита от старта до инициализации (on_startup не отработал)
     if _generation_semaphore is None:
         await message.answer("❌ Бот ещё не готов, попробуй через несколько секунд.")
         return
 
-    # Если все слоты заняты — предупреждаем пользователя и ждём в очереди
     if _active_tasks >= MAX_CONCURRENT_TASKS:
         await message.answer(
-            "⏳ <b>Все слоты заняты.</b> Твоя задача поставлена в очередь — "
-            "генерация начнётся автоматически, как только освободится место.",
+            "⏳ <b>Все слоты заняты.</b> Задача в очереди — начнётся автоматически.",
             parse_mode="HTML",
         )
-    await _generation_semaphore.acquire()
 
+    await _generation_semaphore.acquire()
     _active_tasks += 1
 
     try:
-        # ── ФАЗА 0: уведомление ────────────────────────────────────────────
-        temp_msg = await message.answer(
-            "⏳ <i>Подготовка структуры сценария...</i>", parse_mode="HTML"
-        )
+        temp_msg = await message.answer("⏳ <i>Подготовка структуры...</i>", parse_mode="HTML")
 
-        # ── ФАЗА 1: генерация плана ────────────────────────────────────────
+        # ── ПЛАН ───────────────────────────────────────────────────────────
         target_chapters = max(1, round(words_target / WORDS_PER_CHAPTER))
 
         plan_prompt = (
             f"Составь план YouTube-видео на тему: «{data['topic']}».\n"
             f"Нужно ровно {target_chapters} пунктов — не больше, не меньше.\n\n"
-            f"ЖЁСТКИЕ ТРЕБОВАНИЯ К КАЖДОМУ ПУНКТУ:\n"
-            f"1. Каждый пункт — отдельный, самостоятельный аспект темы (5–10 слов).\n"
-            f"2. Биографию, знакомство с героями и контекст эпохи — ТОЛЬКО в 1-м пункте. "
-            f"Все остальные пункты НЕ могут начинаться с «знакомства» или «введения».\n"
-            f"3. Каждый пункт отвечает на ДРУГОЙ вопрос: кто, что, почему, как, когда, "
-            f"с каким результатом — ни один вопрос не повторяется дважды.\n"
-            f"4. Запрещены похожие по смыслу пункты. Если два пункта можно перепутать — "
-            f"один из них неверный.\n"
-            f"5. Только нумерованный список, без пояснений и вступлений."
+            f"ЖЁСТКИЕ ТРЕБОВАНИЯ:\n"
+            f"1. Каждый пункт — отдельный самостоятельный аспект (5–10 слов).\n"
+            f"2. Биография и контекст эпохи — ТОЛЬКО в 1-м пункте.\n"
+            f"3. Каждый пункт отвечает на ДРУГОЙ вопрос (кто/что/почему/как/когда).\n"
+            f"4. Запрещены похожие по смыслу пункты.\n"
+            f"5. Только нумерованный список без пояснений."
         )
-        resp_text = await api_call_with_retry(
-            model_id,
-            [{"role": "user", "content": plan_prompt}],
-            max_tokens=2500,
+        plan_raw = await api_call_with_retry(
+            model_id, [{"role": "user", "content": plan_prompt}], 2500,
         )
-        plan_text = resp_text
 
-        # ── Валидация плана: убираем смысловые дубли ──────────────────────
         validate_prompt = (
-            f"Вот план YouTube-видео ({target_chapters} пунктов):\n\n{plan_text}\n\n"
-            f"Найди пункты, которые пересекаются по смыслу или описывают одно и то же "
-            f"с разных сторон. Перепиши ТОЛЬКО такие пункты так, чтобы каждый раскрывал "
-            f"строго отдельный аспект, не похожий на другие. "
-            f"Верни полный список ровно из {target_chapters} пунктов — нумерованный, "
-            f"без пояснений. Если дублей нет — верни исходный список без изменений."
+            f"Вот план ({target_chapters} пунктов):\n\n{plan_raw}\n\n"
+            f"Найди пункты, пересекающиеся по смыслу, перепиши их.\n"
+            f"Верни ровно {target_chapters} пунктов нумерованным списком. "
+            f"Если дублей нет — верни исходный список."
         )
-        validated_text = await api_call_with_retry(
-            model_id,
-            [{"role": "user", "content": validate_prompt}],
-            max_tokens=2500,
+        validated = await api_call_with_retry(
+            model_id, [{"role": "user", "content": validate_prompt}], 2500,
         )
-        # Берём валидированный план если он не пустой
-        if validated_text and validated_text.strip():
-            plan_text = validated_text
-            logging.info(f"[{task_id}] ✅ План прошёл валидацию дублей")
+        if validated and validated.strip():
+            plan_raw = validated
 
-        chapters = parse_plan_chapters(plan_text, target_chapters)
+        chapters = parse_plan_chapters(plan_raw, target_chapters)
         n        = len(chapters)
 
-        # Целевое число слов на одну часть (точное)
-        words_per_chapter = words_target // n
-
-        # Сколько слов просить у модели — с поправкой под конкретную модель
-        overrequest_factor = VOLUME_OVERREQUEST_FACTORS.get(
-            model_id, VOLUME_OVERREQUEST_FACTOR_DEFAULT
-        )
-        words_to_request = max(50, int(words_per_chapter * overrequest_factor))
-
-        # max_tokens: ~2 токена на русское слово + 20 % буфер
+        words_per_chapter  = words_target // n
+        overrequest_factor = VOLUME_OVERREQUEST_FACTORS.get(model_id, VOLUME_OVERREQUEST_FACTOR_DEFAULT)
+        words_to_request   = max(50, int(words_per_chapter * overrequest_factor))
         max_tokens_chapter = min(int(words_to_request * 2.4), 2048)
-
-        # Позиции CTA (0-based индексы глав)
-        cta_positions = compute_cta_positions(n)
-
-        # Контекст: строка со всем планом (для передачи в каждую главу)
-        full_plan_str = "\n".join(
-            f"{i+1}. {title}" for i, title in enumerate(chapters)
-        )
-
-        # ── ФАЗА 2: статусное сообщение ────────────────────────────────────
-        chunk_size   = 5
-        total_chunks = math.ceil(n / chunk_size)
+        cta_positions      = compute_cta_positions(n)
+        full_plan_str      = "\n".join(f"{i+1}. {t}" for i, t in enumerate(chapters))
+        chunk_size         = 5
+        total_chunks       = math.ceil(n / chunk_size)
 
         cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(
-                text="❌ Отменить генерацию",
-                callback_data=f"cancel_{task_id}",
-            )]
+            [InlineKeyboardButton(text="❌ Отменить", callback_data=f"cancel_{task_id}")]
         ])
         try:
             await temp_msg.delete()
@@ -773,229 +993,167 @@ async def generate_script(message: types.Message, state: FSMContext):
             reply_markup=cancel_kb, parse_mode="HTML",
         )
 
-        # ── ФАЗА 3: генерация сценария ────────────────────────────────────
+        # ── ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ГЕНЕРАЦИИ ──────────────────────────────
         full_script_parts: list[str] = [""] * n
-
-        # Сколько вводных глав генерировать последовательно.
-        # Именно они чаще всего повторяют «знакомство с темой».
         SEQ_INTRO_CHAPTERS = min(3, n)
+        covered_summary    = ""
 
-        # Сводка уже раскрытых тезисов — обновляется после каждой пачки
-        covered_summary: str = ""
-
-        def build_prompt(index: int, title: str,
-                         prev_text: str = "", covered: str = "",
-                         include_cta: bool = False) -> str:
-            """Собирает промпт для одной части с учётом контекста."""
-            cta_instruction = (
-                "\n5. CTA: В конце этой части — естественный, ненавязчивый призыв написать "
-                "в комментариях одно слово или короткий ответ на вопрос, связанный с темой. "
-                "Органично вплети в текст, не выделяй отдельным абзацем."
-                if include_cta
-                else "\n5. CTA: В этой части НЕТ призыва к комментариям."
+        def build_chapter_prompt(index, title, prev_text="", covered="", include_cta=False):
+            cta_instr = (
+                "\n5. CTA: В конце — ненавязчивый призыв написать одно слово в комментариях."
+                if include_cta else "\n5. CTA: В этой части НЕТ призыва."
             )
             prev_block = (
-                f"\nТЕКСТ ПРЕДЫДУЩЕЙ ЧАСТИ (для плавного перехода, не повторяй):\n"
-                f"{prev_text[-800:]}\n"
+                f"\nПРЕДЫДУЩАЯ ЧАСТЬ (не повторяй):\n{prev_text[-800:]}\n"
                 if prev_text else ""
             )
             covered_block = (
-                f"\nУЖЕ РАСКРЫТЫЕ ТЕЗИСЫ (их нельзя повторять):\n{covered}\n"
+                f"\nУЖЕ РАСКРЫТО (нельзя повторять):\n{covered}\n"
                 if covered else ""
             )
             return (
                 f"Ты пишешь часть сценария для YouTube-видео.\n\n"
-                f"ОБЩАЯ ТЕМА ВИДЕО: {data['topic']}\n\n"
-                f"ПОЛНЫЙ ПЛАН СЦЕНАРИЯ (все {n} частей):\n{full_plan_str}\n\n"
-                f"ТВОЯ ЗАДАЧА: написать ТОЛЬКО часть №{index+1} — «{title}».\n"
-                f"Все остальные части уже распределены. "
-                f"Не повторяй тезисы, факты и примеры из других частей плана."
-                f"{prev_block}"
-                f"{covered_block}\n"
+                f"ТЕМА: {data['topic']}\n\n"
+                f"ПЛАН ({n} частей):\n{full_plan_str}\n\n"
+                f"ЗАДАЧА: написать ТОЛЬКО часть №{index+1} — «{title}».\n"
+                f"Не повторяй тезисы из других частей."
+                f"{prev_block}{covered_block}\n"
                 f"СТИЛЬ: {style_prompt}\n\n"
-                f"СТРОГИЕ ПРАВИЛА:\n"
-                f"1. ОБЪЁМ: Напиши ровно {words_to_request} слов "
-                f"(это {round(words_to_request/WORDS_PER_MINUTE, 1)} мин. речи). "
-                f"Не пиши ничего кроме самого текста сценария — никаких пометок, подсчётов или проверок.\n"
-                f"2. ФОРМАТ: ТОЛЬКО сплошной текст. Запрещено: заголовки, символы #, *, "
-                f"слова «Глава», «Часть», «Раздел», горизонтальные линии (---), списки.\n"
-                f"3. НАЧАЛО: сразу с первого слова текста, без вступлений.\n"
-                f"4. КОНЕЦ: завершай мысль естественно, не обрывай на полуслове."
-                f"{cta_instruction}"
+                f"ПРАВИЛА:\n"
+                f"1. ОБЪЁМ: ровно {words_to_request} слов. Никаких пометок.\n"
+                f"2. ФОРМАТ: только сплошной текст. Без заголовков, #, *, ---, списков.\n"
+                f"3. НАЧАЛО: сразу с первого слова.\n"
+                f"4. КОНЕЦ: завершай мысль естественно."
+                f"{cta_instr}"
             )
 
-        async def generate_one(index: int, title: str,
-                               prev_text: str = "", covered: str = "",
-                               is_regen: bool = False) -> None:
-            """Генерирует одну часть и кладёт в full_script_parts."""
+        async def generate_one(index, title, prev_text="", covered="", is_regen=False):
             if await get_task_status(task_id) == "Cancelled":
                 return
-            prompt = build_prompt(index, title, prev_text, covered,
-                                  include_cta=(index in cta_positions) and not is_regen)
+            prompt = build_chapter_prompt(
+                index, title, prev_text, covered,
+                include_cta=(index in cta_positions) and not is_regen,
+            )
             try:
                 raw   = await api_call_with_retry(
-                    model_id,
-                    [{"role": "user", "content": prompt}],
-                    max_tokens=max_tokens_chapter,
+                    model_id, [{"role": "user", "content": prompt}], max_tokens_chapter,
                 )
                 clean = clean_chapter_text(raw)
                 full_script_parts[index] = clean + "\n\n"
-                logging.info(
-                    f"[{task_id}] ✅ Часть {index+1}/{n} — "
-                    f"{len(clean.split())} слов"
-                )
+                logging.info(f"[{task_id}] ✅ {index+1}/{n} — {len(clean.split())} слов")
             except Exception as e:
-                logging.error(f"[{task_id}] ❌ Часть {index+1}: {e}")
+                logging.error(f"[{task_id}] ❌ {index+1}: {e}")
                 full_script_parts[index] = ""
 
-        async def get_covered_summary(texts: list[str]) -> str:
-            """
-            Быстрый запрос к API: в 3-4 предложениях — какие тезисы
-            уже раскрыты в переданных частях. Используется как контекст
-            для следующей пачки чтобы избежать повторений.
-            """
+        async def get_covered_summary(texts):
             combined = " ".join(t[:600] for t in texts if t)
             if not combined.strip():
                 return ""
             try:
-                summary = await api_call_with_retry(
+                return (await api_call_with_retry(
                     model_id,
-                    [{"role": "user", "content": (
-                        f"Перечисли в 3-4 предложениях ключевые тезисы, факты и примеры, "
-                        f"которые уже раскрыты в следующем тексте. "
-                        f"Только суть, без воды:\n\n{combined}"
-                    )}],
-                    max_tokens=300,
-                )
-                return summary.strip()
+                    [{"role": "user", "content":
+                      f"Перечисли в 3-4 предложениях ключевые тезисы. Только суть:\n\n{combined}"}],
+                    300,
+                )).strip()
             except Exception:
                 return ""
 
+        # ── ГЕНЕРАЦИЯ ЧАСТЕЙ ───────────────────────────────────────────────
         done_count = 0
 
-        # ── 3а: Вводные части — последовательно с передачей контекста ──────
-        logging.info(f"[{task_id}] 📖 Последовательная генерация вводных частей (1–{SEQ_INTRO_CHAPTERS})")
+        # Последовательно — первые 3 (вводные)
         for i in range(SEQ_INTRO_CHAPTERS):
             if await get_task_status(task_id) == "Cancelled":
                 return
-            prev = full_script_parts[i - 1] if i > 0 else ""
-            await generate_one(i, chapters[i], prev_text=prev, covered=covered_summary,
-                               is_regen=False)
+            prev = full_script_parts[i-1] if i > 0 else ""
+            await generate_one(i, chapters[i], prev_text=prev, covered=covered_summary)
             done_count += 1
             await safe_edit(
                 status_msg,
                 build_progress_text(task_id, friendly_model, n, done_count,
-                                    math.ceil((n - done_count) / chunk_size)),
+                                    max(0, math.ceil((n - done_count) / chunk_size))),
                 reply_markup=cancel_kb,
             )
 
-        # Получаем сводку по вводным частям для передачи в параллельные пачки
         covered_summary = await get_covered_summary(
             [full_script_parts[i] for i in range(SEQ_INTRO_CHAPTERS)]
         )
-        logging.info(f"[{task_id}] 📝 Сводка вводных частей получена")
 
-        # ── 3б: Остальные части — параллельными пачками со сводкой ─────────
-        remaining_indices = list(range(SEQ_INTRO_CHAPTERS, n))
-        for batch_start in range(0, len(remaining_indices), chunk_size):
+        # Параллельно — остальные пачками
+        remaining = list(range(SEQ_INTRO_CHAPTERS, n))
+        for batch_start in range(0, len(remaining), chunk_size):
             if await get_task_status(task_id) == "Cancelled":
                 return
-
-            batch = remaining_indices[batch_start:batch_start + chunk_size]
-            batch_num = (SEQ_INTRO_CHAPTERS + batch_start) // chunk_size + 1
-
-            logging.info(
-                f"[{task_id}] 🚀 Пачка {batch_num}/{total_chunks}: "
-                f"части {batch[0]+1}–{batch[-1]+1}"
-            )
-            tasks = [
-                generate_one(i, chapters[i], covered=covered_summary)
-                for i in batch
-            ]
-            await asyncio.gather(*tasks)
-
+            batch = remaining[batch_start:batch_start + chunk_size]
+            await asyncio.gather(*[
+                generate_one(i, chapters[i], covered=covered_summary) for i in batch
+            ])
             done_count += len(batch)
-            remaining_chunks_left = max(0, math.ceil((n - done_count) / chunk_size))
-
             await safe_edit(
                 status_msg,
                 build_progress_text(task_id, friendly_model, n, done_count,
-                                    remaining_chunks_left),
+                                    max(0, math.ceil((n - done_count) / chunk_size))),
                 reply_markup=cancel_kb,
             )
             await asyncio.sleep(2)
-
-            # Обновляем сводку раскрытых тезисов для следующей пачки
-            if batch_start + chunk_size < len(remaining_indices):
-                new_summary = await get_covered_summary(
-                    [full_script_parts[i] for i in batch]
-                )
-                if new_summary:
-                    # Накапливаем сводки, но не даём им разрастись
-                    covered_summary = (covered_summary + "\n" + new_summary)[-1200:]
-                    logging.info(f"[{task_id}] 📝 Сводка обновлена")
+            if batch_start + chunk_size < len(remaining):
+                new_sum = await get_covered_summary([full_script_parts[i] for i in batch])
+                if new_sum:
+                    covered_summary = (covered_summary + "\n" + new_sum)[-1200:]
 
         if await get_task_status(task_id) == "Cancelled":
             return
 
-        # ── ФАЗА 4: доработка коротких частей ─────────────────────────────
+        # Доработка коротких частей
         short_indices = [
-            i for i, part in enumerate(full_script_parts)
-            if len(part.split()) < words_per_chapter * MIN_CHAPTER_RATIO
+            i for i, p in enumerate(full_script_parts)
+            if len(p.split()) < words_per_chapter * MIN_CHAPTER_RATIO
         ]
-
         if short_indices:
-            logging.info(
-                f"[{task_id}] 🔧 Коротких частей для доработки: {len(short_indices)}"
-            )
             await safe_edit(
                 status_msg,
                 build_progress_text(task_id, friendly_model, n, n, 0, phase="regen"),
                 reply_markup=cancel_kb,
             )
-
             for attempt in range(MAX_REGEN_ATTEMPTS):
                 if await get_task_status(task_id) == "Cancelled":
                     return
                 if not short_indices:
                     break
-
-                regen_tasks = [generate_one(i, chapters[i], covered=covered_summary,
-                                            is_regen=True)
-                               for i in short_indices]
-                await asyncio.gather(*regen_tasks)
+                await asyncio.gather(*[
+                    generate_one(i, chapters[i], covered=covered_summary, is_regen=True)
+                    for i in short_indices
+                ])
                 await asyncio.sleep(2)
-
-                # Оставляем в списке только те, что всё ещё коротки
                 short_indices = [
                     i for i in short_indices
                     if len(full_script_parts[i].split()) < words_per_chapter * MIN_CHAPTER_RATIO
                 ]
-                logging.info(
-                    f"[{task_id}] 🔧 Попытка {attempt+1}: осталось коротких — {len(short_indices)}"
-                )
+                logging.info(f"[{task_id}] 🔧 Попытка {attempt+1}: осталось коротких {len(short_indices)}")
 
         if await get_task_status(task_id) == "Cancelled":
             return
 
-        # ── ФАЗА 5: сборка и отправка ──────────────────────────────────────
+        # ── СБОРКА ─────────────────────────────────────────────────────────
         full_script = "".join(full_script_parts).strip()
         full_script = re.sub(r'\n{3,}', '\n\n', full_script)
-
-        word_count = len(full_script.split())
-        deviation  = word_count - words_target
-        logging.info(
-            f"[{task_id}] 📊 ИТОГО: {word_count} слов | "
-            f"цель: {words_target} | отклонение: {deviation:+d} ({deviation/words_target*100:+.1f}%)"
-        )
+        word_count  = len(full_script.split())
+        deviation   = word_count - words_target
+        logging.info(f"[{task_id}] 📊 {word_count} слов | цель {words_target} | {deviation:+d}")
 
         with open(file_name, "w", encoding="utf-8") as f:
             f.write(full_script)
 
+        # Списываем кредиты
+        await deduct_credits(user_id, cost, f"🎬 Сценарий {task_id} ({friendly_model}, {duration} мин)")
+        new_balance = await get_balance(user_id)
+
         caption = (
             f"📄 Сценарий ID: {task_id}\n"
-            f"📊 Объём: ~{word_count} слов (~{word_count // WORDS_PER_MINUTE} мин.)\n"
-            f"🎯 Цель была: {words_target} слов ({data['duration']} мин.)"
+            f"📊 ~{word_count} слов (~{word_count // WORDS_PER_MINUTE} мин.)\n"
+            f"🎯 Цель: {words_target} слов ({duration} мин.)\n"
+            f"💰 Списано: {cost:.1f} кред. | Остаток: {new_balance:.1f} кред."
         )
 
         await safe_edit(
@@ -1007,36 +1165,34 @@ async def generate_script(message: types.Message, state: FSMContext):
         try:
             await message.answer_document(FSInputFile(file_name), caption=caption)
         except Exception as e:
-            logging.error(f"[{task_id}] ТГ не отправил файл: {e}")
+            logging.error(f"[{task_id}] ТГ: {e}")
             backup = await upload_to_backup(file_name)
             if backup:
                 await message.answer(
-                    f"⚠️ <b>Telegram не смог отправить файл напрямую</b>, "
-                    f"но я сохранил его в облаке:\n\n"
-                    f"🔗 <a href='{backup}'>Скачать готовый сценарий</a>\n"
-                    f"<i>(Ссылка удалится после скачивания)</i>",
+                    f"⚠️ Telegram не смог отправить файл:\n"
+                    f"🔗 <a href='{backup}'>Скачать</a> <i>(удалится после скачивания)</i>",
                     parse_mode="HTML",
                 )
             else:
-                await message.answer(f"❌ Критическая ошибка: файл {task_id} не отправился.")
+                await message.answer(f"❌ Файл {task_id} не отправился.")
 
         await update_task_status(task_id, "Completed")
 
-        # Кнопка быстрого перехода к новому сценарию
-        new_script_kb = ReplyKeyboardMarkup(keyboard=[
-            [KeyboardButton(text="🎬 Создать сценарий")],
-            [KeyboardButton(text="🔙 Назад в меню")],
-        ], resize_keyboard=True)
         await message.answer(
-            "✅ Готово! Хочешь создать ещё один сценарий?",
-            reply_markup=new_script_kb,
+            f"✅ Готово! Списано <b>{cost:.1f} кред.</b> | Остаток: <b>{new_balance:.1f} кред.</b>\n\n"
+            "Создать ещё один?",
+            reply_markup=ReplyKeyboardMarkup(keyboard=[
+                [KeyboardButton(text="🎬 Создать сценарий")],
+                [KeyboardButton(text="🔙 Назад в меню")],
+            ], resize_keyboard=True),
+            parse_mode="HTML",
         )
 
     except Exception as e:
         logging.error(f"[{task_id}] Критическая ошибка: {e}")
         try:
             await message.answer(
-                f"❌ <b>Ошибка задачи</b> {task_id}\n\n<code>{str(e)}</code>",
+                f"❌ <b>Ошибка</b> {task_id}\n\n<code>{str(e)}</code>",
                 parse_mode="HTML",
             )
         except Exception:
@@ -1044,19 +1200,17 @@ async def generate_script(message: types.Message, state: FSMContext):
         await update_task_status(task_id, f"Error: {str(e)}")
 
     finally:
-        # Гарантированно освобождаем слот очереди, очищаем state и файл
         _active_tasks -= 1
         _generation_semaphore.release()
         await state.clear()
         if os.path.exists(file_name):
             os.remove(file_name)
 
-
 # ---------------------------------------------------------------------------
 # ЗАПУСК
 # ---------------------------------------------------------------------------
 async def main():
-    print("Бот запущен и готов к работе!")
+    print("Бот запущен!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
