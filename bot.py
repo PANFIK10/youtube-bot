@@ -169,6 +169,19 @@ async def init_db():
                 first_topup   BOOLEAN DEFAULT FALSE
             )
         """)
+        # Миграция: добавляем колонки если таблица уже существовала без них
+        for col, definition in [
+            ("credits",       "NUMERIC(12,2) DEFAULT 0"),
+            ("referral_code", "TEXT"),
+            ("referred_by",   "BIGINT"),
+            ("first_topup",   "BOOLEAN DEFAULT FALSE"),
+        ]:
+            try:
+                await conn.execute(
+                    f"ALTER TABLE settings ADD COLUMN IF NOT EXISTS {col} {definition}"
+                )
+            except Exception:
+                pass
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS tasks (
                 task_id    TEXT PRIMARY KEY,
@@ -216,7 +229,7 @@ async def get_or_create_user(user_id: int) -> dict:
 
 async def get_balance(user_id: int) -> float:
     user = await get_or_create_user(user_id)
-    return float(user["credits"])
+    return float(user["credits"] or 0)
 
 
 async def add_credits(user_id: int, amount: float, description: str):
@@ -593,7 +606,7 @@ async def start_cmd(message: types.Message, state: FSMContext):
                 parse_mode="HTML",
             )
 
-    balance = float(user["credits"])
+    balance = float(user["credits"] or 0)
     await message.answer(
         WELCOME_TEXT + f"\n\n💰 Ваш баланс: <b>{balance:.1f} кредитов</b>",
         reply_markup=get_main_kb(), parse_mode="HTML",
@@ -925,6 +938,7 @@ async def generate_script(message: types.Message, state: FSMContext):
 
     if _generation_semaphore is None:
         await message.answer("❌ Бот ещё не готов, попробуй через несколько секунд.")
+        await state.clear()
         return
 
     if _active_tasks >= MAX_CONCURRENT_TASKS:
