@@ -636,6 +636,7 @@ async def process_duration(message: types.Message, state: FSMContext):
 # ---------------------------------------------------------------------------
 @dp.message(ScriptMaker.waiting_for_template)
 async def generate_script(message: types.Message, state: FSMContext):
+    global _active_tasks
     if message.text == "🔙 Назад в меню":
         return await back_to_main(message, state)
     if message.text == "➕ Создать новый шаблон":
@@ -665,6 +666,8 @@ async def generate_script(message: types.Message, state: FSMContext):
 
     file_name = f"script_{task_id.replace(' ', '_')}.txt"
 
+    global _active_tasks
+
     # Защита от старта до инициализации (on_startup не отработал)
     if _generation_semaphore is None:
         await message.answer("❌ Бот ещё не готов, попробуй через несколько секунд.")
@@ -679,7 +682,6 @@ async def generate_script(message: types.Message, state: FSMContext):
         )
     await _generation_semaphore.acquire()
 
-    global _active_tasks
     _active_tasks += 1
 
     try:
