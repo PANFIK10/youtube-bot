@@ -213,7 +213,45 @@ async def get_or_create_user(user_id: int) -> dict:
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow("SELECT * FROM settings WHERE user_id=$1", user_id)
         if row:
-            return dict(row)
+            row_dict = dict(row)
+            needs_update = False
+            updates = []
+            params  = []
+            idx     = 1
+
+            # Существующий пользователь, но credits = NULL после миграции
+            if row_dict.get("credits") is None:
+                updates.append(f"credits=${idx}")
+                params.append(WELCOME_CREDITS)
+                idx += 1
+                needs_update = True
+                # Записываем стартовый бонус в транзакции
+                await conn.execute(
+                    "INSERT INTO transactions (user_id, amount, description, created_at) "
+                    "VALUES ($1,$2,$3,$4)",
+                    user_id, WELCOME_CREDITS, "🎁 Стартовый бонус (миграция)", _now(),
+                )
+
+            # referral_code = NULL после миграции
+            if not row_dict.get("referral_code"):
+                ref_code = _gen_ref_code()
+                updates.append(f"referral_code=${idx}")
+                params.append(ref_code)
+                idx += 1
+                needs_update = True
+
+            if needs_update:
+                params.append(user_id)
+                await conn.execute(
+                    f"UPDATE settings SET {', '.join(updates)} WHERE user_id=${idx}",
+                    *params,
+                )
+                row_dict = dict(await conn.fetchrow(
+                    "SELECT * FROM settings WHERE user_id=$1", user_id,
+                ))
+            return row_dict
+
+        # Новый пользователь
         ref_code = _gen_ref_code()
         await conn.execute(
             "INSERT INTO settings (user_id, model_name, credits, referral_code, referred_by, first_topup) "
@@ -708,18 +746,29 @@ async def packages_cmd(message: types.Message):
 async def referral_cmd(message: types.Message):
     user     = await get_or_create_user(message.from_user.id)
     bot_info = await bot.get_me()
-    ref_link = f"https://t.me/{bot_info.username}?start={user['referral_code']}"
+    ref_code = user["referral_code"]
+    ref_link = f"https://t.me/{bot_info.username}?start={ref_code}"
+
+    # Inline-кнопка позволяет поделиться ссылкой в один тап
+    share_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="📤 Поделиться ссылкой",
+            url=f"https://t.me/share/url?url={ref_link}&text=Попробуй%20этот%20бот%20для%20генерации%20YouTube-сценариев!",
+        )],
+    ])
 
     await message.answer(
         "👥 <b>Реферальная программа</b>\n\n"
         "Приглашайте друзей и получайте бонусы!\n\n"
-        f"🔗 Ваша ссылка:\n<code>{ref_link}</code>\n\n"
+        f"🔗 Ваша ссылка (нажми чтобы скопировать):\n"
+        f"<code>{ref_link}</code>\n\n"
         "<b>Условия:</b>\n"
         f"• Вы получаете <b>{REFERRAL_BONUS_INVITER} кредитов</b> "
         f"когда приглашённый делает первое пополнение\n"
         f"• Приглашённый получает <b>+{REFERRAL_BONUS_INVITEE_PCT}%</b> "
         f"бонусных кредитов к первому пополнению\n\n"
-        "<i>Бонус начисляется автоматически.</i>",
+        "<i>Бонус начисляется автоматически после первой оплаты друга.</i>",
+        reply_markup=share_kb,
         parse_mode="HTML",
     )
 
