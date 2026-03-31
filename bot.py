@@ -666,8 +666,6 @@ async def generate_script(message: types.Message, state: FSMContext):
 
     file_name = f"script_{task_id.replace(' ', '_')}.txt"
 
-    global _active_tasks
-
     # Защита от старта до инициализации (on_startup не отработал)
     if _generation_semaphore is None:
         await message.answer("❌ Бот ещё не готов, попробуй через несколько секунд.")
@@ -749,16 +747,20 @@ async def generate_script(message: types.Message, state: FSMContext):
             reply_markup=cancel_kb, parse_mode="HTML",
         )
 
-        # ── ФАЗА 3: параллельная генерация пачками ─────────────────────────
+        # ── ФАЗА 3: генерация сценария ────────────────────────────────────
         full_script_parts: list[str] = [""] * n
 
-        async def generate_chapter(index: int, title: str, is_regen: bool = False) -> None:
-            """Генерирует одну часть сценария и кладёт результат в full_script_parts."""
-            if await get_task_status(task_id) == "Cancelled":
-                return
+        # Сколько вводных глав генерировать последовательно.
+        # Именно они чаще всего повторяют «знакомство с темой».
+        SEQ_INTRO_CHAPTERS = min(3, n)
 
-            include_cta = (index in cta_positions) and not is_regen
+        # Сводка уже раскрытых тезисов — обновляется после каждой пачки
+        covered_summary: str = ""
 
+        def build_prompt(index: int, title: str,
+                         prev_text: str = "", covered: str = "",
+                         include_cta: bool = False) -> str:
+            """Собирает промпт для одной части с учётом контекста."""
             cta_instruction = (
                 "\n5. CTA: В конце этой части — естественный, ненавязчивый призыв написать "
                 "в комментариях одно слово или короткий ответ на вопрос, связанный с темой. "
@@ -766,14 +768,24 @@ async def generate_script(message: types.Message, state: FSMContext):
                 if include_cta
                 else "\n5. CTA: В этой части НЕТ призыва к комментариям."
             )
-
-            prompt = (
+            prev_block = (
+                f"\nТЕКСТ ПРЕДЫДУЩЕЙ ЧАСТИ (для плавного перехода, не повторяй):\n"
+                f"{prev_text[-800:]}\n"
+                if prev_text else ""
+            )
+            covered_block = (
+                f"\nУЖЕ РАСКРЫТЫЕ ТЕЗИСЫ (их нельзя повторять):\n{covered}\n"
+                if covered else ""
+            )
+            return (
                 f"Ты пишешь часть сценария для YouTube-видео.\n\n"
                 f"ОБЩАЯ ТЕМА ВИДЕО: {data['topic']}\n\n"
                 f"ПОЛНЫЙ ПЛАН СЦЕНАРИЯ (все {n} частей):\n{full_plan_str}\n\n"
                 f"ТВОЯ ЗАДАЧА: написать ТОЛЬКО часть №{index+1} — «{title}».\n"
                 f"Все остальные части уже распределены. "
-                f"Не повторяй тезисы и примеры из других частей плана.\n\n"
+                f"Не повторяй тезисы, факты и примеры из других частей плана."
+                f"{prev_block}"
+                f"{covered_block}\n"
                 f"СТИЛЬ: {style_prompt}\n\n"
                 f"СТРОГИЕ ПРАВИЛА:\n"
                 f"1. ОБЪЁМ: Напиши ровно {words_to_request} слов "
@@ -785,6 +797,15 @@ async def generate_script(message: types.Message, state: FSMContext):
                 f"4. КОНЕЦ: завершай мысль естественно, не обрывай на полуслове."
                 f"{cta_instruction}"
             )
+
+        async def generate_one(index: int, title: str,
+                               prev_text: str = "", covered: str = "",
+                               is_regen: bool = False) -> None:
+            """Генерирует одну часть и кладёт в full_script_parts."""
+            if await get_task_status(task_id) == "Cancelled":
+                return
+            prompt = build_prompt(index, title, prev_text, covered,
+                                  include_cta=(index in cta_positions) and not is_regen)
             try:
                 raw   = await api_call_with_retry(
                     model_id,
@@ -793,40 +814,100 @@ async def generate_script(message: types.Message, state: FSMContext):
                 )
                 clean = clean_chapter_text(raw)
                 full_script_parts[index] = clean + "\n\n"
-                wc = len(clean.split())
                 logging.info(
-                    f"[{task_id}] ✅ Часть {index+1}/{n} — {wc} слов "
-                    f"(цель {words_per_chapter}, запрошено {words_to_request})"
+                    f"[{task_id}] ✅ Часть {index+1}/{n} — "
+                    f"{len(clean.split())} слов"
                 )
             except Exception as e:
                 logging.error(f"[{task_id}] ❌ Часть {index+1}: {e}")
                 full_script_parts[index] = ""
 
-        # Пачки по chunk_size параллельных запросов
+        async def get_covered_summary(texts: list[str]) -> str:
+            """
+            Быстрый запрос к API: в 3-4 предложениях — какие тезисы
+            уже раскрыты в переданных частях. Используется как контекст
+            для следующей пачки чтобы избежать повторений.
+            """
+            combined = " ".join(t[:600] for t in texts if t)
+            if not combined.strip():
+                return ""
+            try:
+                summary = await api_call_with_retry(
+                    model_id,
+                    [{"role": "user", "content": (
+                        f"Перечисли в 3-4 предложениях ключевые тезисы, факты и примеры, "
+                        f"которые уже раскрыты в следующем тексте. "
+                        f"Только суть, без воды:\n\n{combined}"
+                    )}],
+                    max_tokens=300,
+                )
+                return summary.strip()
+            except Exception:
+                return ""
+
         done_count = 0
-        for batch_start in range(0, n, chunk_size):
+
+        # ── 3а: Вводные части — последовательно с передачей контекста ──────
+        logging.info(f"[{task_id}] 📖 Последовательная генерация вводных частей (1–{SEQ_INTRO_CHAPTERS})")
+        for i in range(SEQ_INTRO_CHAPTERS):
+            if await get_task_status(task_id) == "Cancelled":
+                return
+            prev = full_script_parts[i - 1] if i > 0 else ""
+            await generate_one(i, chapters[i], prev_text=prev, covered=covered_summary,
+                               is_regen=False)
+            done_count += 1
+            await safe_edit(
+                status_msg,
+                build_progress_text(task_id, friendly_model, n, done_count,
+                                    math.ceil((n - done_count) / chunk_size)),
+                reply_markup=cancel_kb,
+            )
+
+        # Получаем сводку по вводным частям для передачи в параллельные пачки
+        covered_summary = await get_covered_summary(
+            [full_script_parts[i] for i in range(SEQ_INTRO_CHAPTERS)]
+        )
+        logging.info(f"[{task_id}] 📝 Сводка вводных частей получена")
+
+        # ── 3б: Остальные части — параллельными пачками со сводкой ─────────
+        remaining_indices = list(range(SEQ_INTRO_CHAPTERS, n))
+        for batch_start in range(0, len(remaining_indices), chunk_size):
             if await get_task_status(task_id) == "Cancelled":
                 return
 
-            batch_indices = list(range(batch_start, min(batch_start + chunk_size, n)))
-            batch_num     = batch_start // chunk_size + 1
+            batch = remaining_indices[batch_start:batch_start + chunk_size]
+            batch_num = (SEQ_INTRO_CHAPTERS + batch_start) // chunk_size + 1
 
             logging.info(
                 f"[{task_id}] 🚀 Пачка {batch_num}/{total_chunks}: "
-                f"части {batch_start+1}–{batch_indices[-1]+1}"
+                f"части {batch[0]+1}–{batch[-1]+1}"
             )
-            tasks = [generate_chapter(i, chapters[i]) for i in batch_indices]
+            tasks = [
+                generate_one(i, chapters[i], covered=covered_summary)
+                for i in batch
+            ]
             await asyncio.gather(*tasks)
 
-            done_count += len(batch_indices)
-            remaining  = total_chunks - batch_num
+            done_count += len(batch)
+            remaining_chunks_left = max(0, math.ceil((n - done_count) / chunk_size))
 
             await safe_edit(
                 status_msg,
-                build_progress_text(task_id, friendly_model, n, done_count, remaining),
+                build_progress_text(task_id, friendly_model, n, done_count,
+                                    remaining_chunks_left),
                 reply_markup=cancel_kb,
             )
             await asyncio.sleep(2)
+
+            # Обновляем сводку раскрытых тезисов для следующей пачки
+            if batch_start + chunk_size < len(remaining_indices):
+                new_summary = await get_covered_summary(
+                    [full_script_parts[i] for i in batch]
+                )
+                if new_summary:
+                    # Накапливаем сводки, но не даём им разрастись
+                    covered_summary = (covered_summary + "\n" + new_summary)[-1200:]
+                    logging.info(f"[{task_id}] 📝 Сводка обновлена")
 
         if await get_task_status(task_id) == "Cancelled":
             return
@@ -853,7 +934,8 @@ async def generate_script(message: types.Message, state: FSMContext):
                 if not short_indices:
                     break
 
-                regen_tasks = [generate_chapter(i, chapters[i], is_regen=True)
+                regen_tasks = [generate_one(i, chapters[i], covered=covered_summary,
+                                            is_regen=True)
                                for i in short_indices]
                 await asyncio.gather(*regen_tasks)
                 await asyncio.sleep(2)
