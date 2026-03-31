@@ -693,10 +693,16 @@ async def generate_script(message: types.Message, state: FSMContext):
 
         plan_prompt = (
             f"Составь план YouTube-видео на тему: «{data['topic']}».\n"
-            f"Нужно ровно {target_chapters} пунктов — не больше, не меньше.\n"
-            f"Каждый пункт — уникальная и конкретная подтема (5–10 слов).\n"
-            f"Темы НЕ должны пересекаться или повторять друг друга.\n"
-            f"Формат: только нумерованный список без пояснений и вступлений."
+            f"Нужно ровно {target_chapters} пунктов — не больше, не меньше.\n\n"
+            f"ЖЁСТКИЕ ТРЕБОВАНИЯ К КАЖДОМУ ПУНКТУ:\n"
+            f"1. Каждый пункт — отдельный, самостоятельный аспект темы (5–10 слов).\n"
+            f"2. Биографию, знакомство с героями и контекст эпохи — ТОЛЬКО в 1-м пункте. "
+            f"Все остальные пункты НЕ могут начинаться с «знакомства» или «введения».\n"
+            f"3. Каждый пункт отвечает на ДРУГОЙ вопрос: кто, что, почему, как, когда, "
+            f"с каким результатом — ни один вопрос не повторяется дважды.\n"
+            f"4. Запрещены похожие по смыслу пункты. Если два пункта можно перепутать — "
+            f"один из них неверный.\n"
+            f"5. Только нумерованный список, без пояснений и вступлений."
         )
         resp_text = await api_call_with_retry(
             model_id,
@@ -704,8 +710,28 @@ async def generate_script(message: types.Message, state: FSMContext):
             max_tokens=2500,
         )
         plan_text = resp_text
-        chapters  = parse_plan_chapters(plan_text, target_chapters)
-        n         = len(chapters)
+
+        # ── Валидация плана: убираем смысловые дубли ──────────────────────
+        validate_prompt = (
+            f"Вот план YouTube-видео ({target_chapters} пунктов):\n\n{plan_text}\n\n"
+            f"Найди пункты, которые пересекаются по смыслу или описывают одно и то же "
+            f"с разных сторон. Перепиши ТОЛЬКО такие пункты так, чтобы каждый раскрывал "
+            f"строго отдельный аспект, не похожий на другие. "
+            f"Верни полный список ровно из {target_chapters} пунктов — нумерованный, "
+            f"без пояснений. Если дублей нет — верни исходный список без изменений."
+        )
+        validated_text = await api_call_with_retry(
+            model_id,
+            [{"role": "user", "content": validate_prompt}],
+            max_tokens=2500,
+        )
+        # Берём валидированный план если он не пустой
+        if validated_text and validated_text.strip():
+            plan_text = validated_text
+            logging.info(f"[{task_id}] ✅ План прошёл валидацию дублей")
+
+        chapters = parse_plan_chapters(plan_text, target_chapters)
+        n        = len(chapters)
 
         # Целевое число слов на одну часть (точное)
         words_per_chapter = words_target // n
