@@ -25,6 +25,10 @@ import aiohttp
 TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN")
 DATABASE_URL       = os.getenv("DATABASE_URL")
 
+# Уведомления об ошибках администратору
+_raw_admins = os.getenv("ADMIN_IDS", "")
+ADMIN_IDS: set[int] = {int(x.strip()) for x in _raw_admins.split(",") if x.strip().isdigit()}
+
 _raw_keys = [
     os.getenv("OPENROUTER_API_KEY"),
     os.getenv("OPENROUTER_API_KEY_1"),
@@ -178,6 +182,15 @@ def _gen_ref_code() -> str:
 def _esc(text: str) -> str:
     """Экранирует спецсимволы HTML чтобы пользовательский ввод не ломал разметку."""
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+async def admin_notify(text: str):
+    """Отправляет уведомление всем администраторам из ADMIN_IDS."""
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, text, parse_mode="HTML")
+        except Exception:
+            pass
 
 # ---------------------------------------------------------------------------
 # БАЗА ДАННЫХ
@@ -1710,6 +1723,14 @@ async def generate_script(message: types.Message, state: FSMContext):
         except Exception:
             pass
         await update_task_status(task_id, f"Error: {str(e)}")
+        await admin_notify(
+            f"🔴 <b>Ошибка генерации</b>\n\n"
+            f"🆔 Task: <code>{task_id}</code>\n"
+            f"👤 User: <code>{user_id}</code>\n"
+            f"🤖 Модель: {friendly_model}\n"
+            f"📄 Тема: {_esc(data.get('topic', '?'))}\n"
+            f"❗ Ошибка: <code>{_esc(str(e))}</code>"
+        )
 
     finally:
         _active_tasks -= 1
@@ -1915,6 +1936,14 @@ async def _generate_single(
         except Exception:
             pass
         await update_task_status(task_id, f"Error: {str(e)}")
+        await admin_notify(
+            f"🔴 <b>Ошибка генерации</b> {task_prefix}\n\n"
+            f"🆔 Task: <code>{task_id}</code>\n"
+            f"👤 User: <code>{user_id}</code>\n"
+            f"🤖 Модель: {friendly_model}\n"
+            f"📄 Тема: {_esc(topic)}\n"
+            f"❗ Ошибка: <code>{_esc(str(e))}</code>"
+        )
         return False
 
     finally:
