@@ -52,6 +52,7 @@ def _next_client() -> AsyncOpenAI:
 MAX_CONCURRENT_TASKS = 25
 _generation_semaphore: asyncio.Semaphore | None = None
 _active_tasks: int = 0
+_user_tasks: dict[int, int] = {}  # user_id → кол-во активных задач
 
 API_RETRY_ATTEMPTS   = 3
 API_RETRY_BASE_DELAY = 2.0
@@ -121,8 +122,11 @@ MODEL_PRICE_PER_MINUTE: dict[str, float] = {
 
 WELCOME_CREDITS = 50  # стартовый бонус новому пользователю
 
-REFERRAL_BONUS_INVITER     = 25   # кредитов рефереру после первого пополнения приглашённого
-REFERRAL_BONUS_INVITEE_PCT = 10   # % бонуса приглашённому к первому пополнению
+REFERRAL_BONUS_INVITER     = 25
+REFERRAL_BONUS_INVITEE_PCT = 10
+
+MAX_TASKS_PER_USER    = 2     # макс. одновременных задач от одного пользователя
+LOW_BALANCE_THRESHOLD = 20.0  # уведомлять если баланс ниже этого порога после генерации
 
 # Пакеты: (цена ₽, базовых кредитов, бонус кредитов, название)
 CREDIT_PACKAGES = [
@@ -520,6 +524,7 @@ class TemplateManager(StatesGroup):
     waiting_for_new_name    = State()
     waiting_for_new_prompt  = State()
     waiting_for_delete_name = State()
+    waiting_for_edit_name   = State()
 
 # ---------------------------------------------------------------------------
 # КЛАВИАТУРЫ
@@ -675,6 +680,16 @@ async def restart_cmd(message: types.Message, state: FSMContext):
         WELCOME_TEXT + f"\n\n💰 Ваш баланс: <b>{balance:.1f} кредитов</b>",
         reply_markup=get_main_kb(), parse_mode="HTML",
     )
+
+
+@dp.message(Command("cancel"))
+async def cancel_cmd(message: types.Message, state: FSMContext):
+    current = await state.get_state()
+    if current is None:
+        await message.answer("Нет активных действий для отмены.", reply_markup=get_main_kb())
+        return
+    await state.clear()
+    await message.answer("🛑 Действие отменено.", reply_markup=get_main_kb())
 
 
 @dp.message(F.text == "🔙 Назад в меню")
@@ -835,8 +850,27 @@ async def add_template_start(message: types.Message, state: FSMContext):
 
 @dp.message(F.text == "✏️ Изменить шаблон")
 async def edit_template_start(message: types.Message, state: FSMContext):
-    await message.answer("Какой изменить?", reply_markup=await get_dynamic_templates_kb())
-    await state.set_state(TemplateManager.waiting_for_new_name)
+    await message.answer("Какой шаблон хочешь изменить?", reply_markup=await get_dynamic_templates_kb())
+    await state.set_state(TemplateManager.waiting_for_edit_name)
+
+
+@dp.message(TemplateManager.waiting_for_edit_name)
+async def edit_template_pick(message: types.Message, state: FSMContext):
+    if message.text == "🔙 Назад в меню":
+        return await back_to_main(message, state)
+    templates = await get_templates()
+    if message.text not in templates:
+        await message.answer("Выбери из списка:", reply_markup=await get_dynamic_templates_kb())
+        return
+    current_prompt = templates[message.text]
+    await state.update_data(template_name=message.text)
+    await message.answer(
+        f"✏️ Шаблон: <b>{message.text}</b>\n\n"
+        f"📄 Текущий промпт:\n<blockquote>{current_prompt}</blockquote>\n\n"
+        f"Отправь новый текст промпта:",
+        reply_markup=types.ReplyKeyboardRemove(), parse_mode="HTML",
+    )
+    await state.set_state(TemplateManager.waiting_for_new_prompt)
 
 
 @dp.message(TemplateManager.waiting_for_new_name)
@@ -881,6 +915,12 @@ async def delete_template_confirm(message: types.Message, state: FSMContext):
 # ---------------------------------------------------------------------------
 # ОТМЕНА
 # ---------------------------------------------------------------------------
+
+@dp.callback_query(F.data == "goto_topup")
+async def goto_topup(call: types.CallbackQuery):
+    await call.answer()
+    await topup_cmd(call.message)
+
 
 @dp.callback_query(F.data.startswith("cancel_"))
 async def cancel_task_handler(call: types.CallbackQuery):
@@ -1203,6 +1243,16 @@ async def generate_script(message: types.Message, state: FSMContext):
         await state.clear()
         return
 
+    # Проверка лимита задач на пользователя
+    if _user_tasks.get(user_id, 0) >= MAX_TASKS_PER_USER:
+        await message.answer(
+            f"⚠️ У тебя уже {MAX_TASKS_PER_USER} задачи в работе.\n"
+            f"Дождись завершения перед запуском новой.",
+            reply_markup=get_main_kb(), parse_mode="HTML",
+        )
+        await state.clear()
+        return
+
     if _active_tasks >= MAX_CONCURRENT_TASKS:
         await message.answer(
             "⏳ <b>Все слоты заняты.</b> Задача в очереди — начнётся автоматически.",
@@ -1211,6 +1261,7 @@ async def generate_script(message: types.Message, state: FSMContext):
 
     await _generation_semaphore.acquire()
     _active_tasks += 1
+    _user_tasks[user_id] = _user_tasks.get(user_id, 0) + 1
 
     try:
         temp_msg = await message.answer("⏳ <i>Подготовка структуры...</i>", parse_mode="HTML")
@@ -1467,6 +1518,17 @@ async def generate_script(message: types.Message, state: FSMContext):
             parse_mode="HTML",
         )
 
+        # Уведомление о низком балансе
+        if new_balance < LOW_BALANCE_THRESHOLD:
+            await message.answer(
+                f"⚠️ <b>Баланс заканчивается</b> — осталось <b>{new_balance:.1f} кред.</b>\n"
+                f"Пополни чтобы продолжить генерацию.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="💳 Пополнить", callback_data="goto_topup")]
+                ]),
+                parse_mode="HTML",
+            )
+
     except Exception as e:
         logging.error(f"[{task_id}] Критическая ошибка: {e}")
         try:
@@ -1480,6 +1542,7 @@ async def generate_script(message: types.Message, state: FSMContext):
 
     finally:
         _active_tasks -= 1
+        _user_tasks[user_id] = max(0, _user_tasks.get(user_id, 1) - 1)
         _generation_semaphore.release()
         await state.clear()
         if os.path.exists(file_name):
@@ -1613,10 +1676,11 @@ async def _generate_single(
 
         covered_summary = await get_summary([full_script_parts[i] for i in range(SEQ_INTRO_CHAPTERS)])
 
-        for batch_start in range(0, len(range(SEQ_INTRO_CHAPTERS, n)), chunk_size):
+        remaining_indices = list(range(SEQ_INTRO_CHAPTERS, n))
+        for batch_start in range(0, len(remaining_indices), chunk_size):
             if await get_task_status(task_id) == "Cancelled":
                 return False
-            batch = list(range(SEQ_INTRO_CHAPTERS, n))[batch_start:batch_start + chunk_size]
+            batch = remaining_indices[batch_start:batch_start + chunk_size]
             await asyncio.gather(*[gen_one(i, chapters[i], covered=covered_summary) for i in batch])
             done_count += len(batch)
             await safe_edit(status_msg,
@@ -1624,7 +1688,7 @@ async def _generate_single(
                                     max(0, math.ceil((n - done_count) / chunk_size))),
                 reply_markup=cancel_kb)
             await asyncio.sleep(2)
-            if batch_start + chunk_size < len(list(range(SEQ_INTRO_CHAPTERS, n))):
+            if batch_start + chunk_size < len(remaining_indices):
                 new_sum = await get_summary([full_script_parts[i] for i in batch])
                 if new_sum:
                     covered_summary = (covered_summary + "\n" + new_sum)[-1200:]
