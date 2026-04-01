@@ -1075,33 +1075,33 @@ async def generate_script(message: types.Message, state: FSMContext):
         covered_summary    = ""
 
         def build_chapter_prompt(index, title, prev_text="", covered="", include_cta=False):
-        cta_instr = (
-            "\n5. CTA: В конце — ненавязчивый призыв написать одно слово в комментариях."
-            if include_cta else ""
-        )
-        prev_block = (
-            f"\nПРЕДЫДУЩАЯ ЧАСТЬ (не повторяй):\n{prev_text[-800:]}\n"
-            if prev_text else ""
-        )
-        covered_block = (
-            f"\nУЖЕ РАСКРЫТО (нельзя повторять):\n{covered}\n"
-            if covered else ""
-        )
-        return (
-            f"Ты пишешь часть сценария для YouTube-видео.\n\n"
-            f"ТЕМА: {data['topic']}\n\n"
-            f"ПЛАН ({n} частей):\n{full_plan_str}\n\n"
-            f"ЗАДАЧА: написать ТОЛЬКО часть №{index+1} — «{title}».\n"
-            f"Не повторяй тезисы из других частей."
-            f"{prev_block}{covered_block}\n"
-            f"ГЛАВНОЕ ТРЕБОВАНИЕ К СТИЛЮ И ПОДАЧЕ (в приоритете):\n{style_prompt}\n\n"
-            f"ТЕХНИЧЕСКИЕ ОГРАНИЧЕНИЯ (обязательны):\n"
-            f"1. ОБЪЁМ: ровно {words_to_request} слов. Никаких пометок и подсчётов.\n"
-            f"2. ФОРМАТ: только сплошной текст. Без заголовков, #, *, ---, списков.\n"
-            f"3. НАЧАЛО: сразу с первого слова, без вступлений.\n"
-            f"4. КОНЕЦ: завершай мысль естественно."
-            f"{cta_instr}"
-        )
+            cta_instr = (
+                "\n5. CTA: В конце — ненавязчивый призыв написать одно слово в комментариях."
+                if include_cta else ""
+            )
+            prev_block = (
+                f"\nПРЕДЫДУЩАЯ ЧАСТЬ (не повторяй):\n{prev_text[-800:]}\n"
+                if prev_text else ""
+            )
+            covered_block = (
+                f"\nУЖЕ РАСКРЫТО (нельзя повторять):\n{covered}\n"
+                if covered else ""
+            )
+            return (
+                f"Ты пишешь часть сценария для YouTube-видео.\n\n"
+                f"ТЕМА: {data['topic']}\n\n"
+                f"ПЛАН ({n} частей):\n{full_plan_str}\n\n"
+                f"ЗАДАЧА: написать ТОЛЬКО часть №{index+1} — «{title}».\n"
+                f"Не повторяй тезисы из других частей."
+                f"{prev_block}{covered_block}\n"
+                f"ГЛАВНОЕ ТРЕБОВАНИЕ К СТИЛЮ И ПОДАЧЕ (в приоритете):\n{style_prompt}\n\n"
+                f"ТЕХНИЧЕСКИЕ ОГРАНИЧЕНИЯ (обязательны):\n"
+                f"1. ОБЪЁМ: ровно {words_to_request} слов. Никаких пометок и подсчётов.\n"
+                f"2. ФОРМАТ: только сплошной текст. Без заголовков, #, *, ---, списков.\n"
+                f"3. НАЧАЛО: сразу с первого слова, без вступлений.\n"
+                f"4. КОНЕЦ: завершай мысль естественно."
+                f"{cta_instr}"
+            )
 
         async def generate_one(index, title, prev_text="", covered="", is_regen=False):
             if await get_task_status(task_id) == "Cancelled":
