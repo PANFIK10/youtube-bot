@@ -175,6 +175,7 @@ async def init_db():
             ("referral_code", "TEXT"),
             ("referred_by",   "BIGINT"),
             ("first_topup",   "BOOLEAN DEFAULT FALSE"),
+            ("username",      "TEXT"),
         ]:
             try:
                 await conn.execute(
@@ -630,9 +631,18 @@ def build_packages_text() -> str:
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message, state: FSMContext):
     await state.clear()
-    user_id = message.from_user.id
-    args    = message.text.split()
-    user    = await get_or_create_user(user_id)
+    user_id  = message.from_user.id
+    username = message.from_user.username  # может быть None
+    args     = message.text.split()
+    user     = await get_or_create_user(user_id)
+
+    # Сохраняем/обновляем username при каждом старте
+    if username:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE settings SET username=$1 WHERE user_id=$2",
+                username.lower(), user_id,
+            )
 
     # Реферальный код в параметре /start
     if len(args) > 1:
