@@ -537,7 +537,7 @@ def get_main_kb():
         [KeyboardButton(text="📋 Тарифы"),   KeyboardButton(text="📦 Пакеты")],
         [KeyboardButton(text="📁 Шаблоны"),  KeyboardButton(text="⚙️ Настройки")],
         [KeyboardButton(text="👥 Реферальная программа")],
-        [KeyboardButton(text="❓ FAQ"),       KeyboardButton(text="🔄 Перезапустить")],
+        [KeyboardButton(text="❓ FAQ"),       KeyboardButton(text="🏠 Главная")],
     ], resize_keyboard=True)
 
 def get_models_kb():
@@ -565,15 +565,30 @@ async def get_dynamic_templates_kb(for_generation: bool = False):
 # ---------------------------------------------------------------------------
 # ТЕКСТЫ
 # ---------------------------------------------------------------------------
-WELCOME_TEXT = (
-    "👋 <b>Добро пожаловать в генератор сценариев!</b>\n\n"
-    "Создавайте готовые YouTube-сценарии без ограничений.\n\n"
-    "🟢 <b>Gemini</b> — бюджет\n"
-    "🔵 <b>Grok</b> — дерзость\n"
-    "🟡 <b>Claude Haiku</b> — стиль\n"
-    "🟠 <b>ChatGPT</b> — логика\n"
-    "🔴 <b>Claude Sonnet ✨</b> — элита\n\n"
-    f"🎁 Вам начислено <b>{WELCOME_CREDITS} стартовых кредитов</b>!"
+WELCOME_NEW_TEXT = (
+    "👋 <b>Добро пожаловать в Авто Сценарист!</b>\n\n"
+    "Генерируй готовые YouTube-сценарии за минуты — "
+    "без копирайтеров, без ограничений по длине, без склеек.\n\n"
+    "✨ <b>Почему выбирают нас:</b>\n"
+    "⚡ Сценарий на 60 минут — за 3-5 минут\n"
+    "🗂 Массовая генерация — до 5 сценариев за раз\n"
+    "🤖 5 топовых моделей — GPT, Claude, Gemini, Grok\n"
+    "💰 От 9₽ за полный 60-минутный сценарий\n"
+    "🎯 Любая ниша — история, бизнес, технологии, лайфстайл\n\n"
+    "──────────────────────────\n"
+    "🟢 <b>Gemini</b> — быстро и бюджетно\n"
+    "🔵 <b>Grok</b> — дерзко и смело\n"
+    "🟡 <b>Claude Haiku</b> — выдержанный стиль\n"
+    "🟠 <b>ChatGPT</b> — чёткая логика\n"
+    "🔴 <b>Claude Sonnet ✨</b> — элитное качество\n"
+    "──────────────────────────\n\n"
+    f"🎁 Тебе начислено <b>{WELCOME_CREDITS} стартовых кредитов</b> — "
+    f"хватит на несколько сценариев прямо сейчас!"
+)
+
+WELCOME_RETURN_TEXT = (
+    "👋 <b>С возвращением!</b>\n\n"
+    "Готов создавать новые сценарии — жми кнопку и поехали 🚀"
 )
 
 FAQ_TEXT = (
@@ -619,7 +634,8 @@ FAQ_TEXT = (
 
     "❌ <b>Что если файл не пришёл?</b>\n"
     "Кредиты списываются только после успешной отправки файла. "
-    "Попробуй снова — если проблема повторяется, напиши в поддержку.\n\n"
+    "Попробуй снова — если проблема повторяется, напиши в "
+    "<a href='https://t.me/aass11463'>поддержку</a>.\n\n"
 
     "💳 <b>Как пополнить баланс?</b>\n"
     "Нажми «💳 Пополнить», выбери пакет и следуй инструкции. "
@@ -719,19 +735,24 @@ async def start_cmd(message: types.Message, state: FSMContext):
                 parse_mode="HTML",
             )
 
-    balance = float(user["credits"] or 0)
-    await message.answer(
-        WELCOME_TEXT + f"\n\n💰 Ваш баланс: <b>{balance:.1f} кредитов</b>",
-        reply_markup=get_main_kb(), parse_mode="HTML",
-    )
+    balance   = float(user["credits"] or 0)
+    is_new    = balance == WELCOME_CREDITS and not user.get("first_topup")
+
+    if is_new:
+        welcome = WELCOME_NEW_TEXT + f"\n\n💰 Ваш баланс: <b>{balance:.1f} кредитов</b>"
+    else:
+        welcome = WELCOME_RETURN_TEXT + f"\n\n💰 Баланс: <b>{balance:.1f} кредитов</b>"
+
+    await message.answer(welcome, reply_markup=get_main_kb(), parse_mode="HTML")
 
 
-@dp.message(F.text == "🔄 Перезапустить")
-async def restart_cmd(message: types.Message, state: FSMContext):
+@dp.message(Command("menu"))
+@dp.message(F.text == "🏠 Главная")
+async def home_cmd(message: types.Message, state: FSMContext):
     await state.clear()
     balance = await get_balance(message.from_user.id)
     await message.answer(
-        WELCOME_TEXT + f"\n\n💰 Ваш баланс: <b>{balance:.1f} кредитов</b>",
+        f"🏠 Главное меню\n💰 Баланс: <b>{balance:.1f} кред.</b>",
         reply_markup=get_main_kb(), parse_mode="HTML",
     )
 
@@ -803,7 +824,7 @@ async def pkg_selected(call: types.CallbackQuery):
         f"📦 Пакет <b>{name}</b>\n"
         f"💳 Сумма: <b>{price}₽</b>\n"
         f"🎁 Получите: <b>{total} кредитов</b>\n\n"
-        f"Для оплаты напишите в поддержку с указанием:\n"
+        f"Для оплаты напишите в <a href='https://t.me/aass11463'>поддержку</a>:\n"
         f"• Пакет: <b>{name}</b>\n"
         f"• Ваш ID: <code>{call.from_user.id}</code>",
         parse_mode="HTML",
@@ -844,7 +865,7 @@ async def referral_cmd(message: types.Message):
     share_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
             text="📤 Поделиться ссылкой",
-            url=f"https://t.me/share/url?url={ref_link}&text=Попробуй%20этот%20бот%20для%20генерации%20YouTube-сценариев!",
+            url=f"https://t.me/share/url?url={ref_link}",
         )],
     ])
 
@@ -1573,10 +1594,23 @@ async def generate_script(message: types.Message, state: FSMContext):
             "Создать ещё один?",
             reply_markup=ReplyKeyboardMarkup(keyboard=[
                 [KeyboardButton(text="🎬 Создать сценарий")],
-                [KeyboardButton(text="🔙 Назад в меню")],
+                [KeyboardButton(text="🏠 Главная")],
             ], resize_keyboard=True),
             parse_mode="HTML",
         )
+
+        # Мягкий призыв к рефералке каждые 3 завершённых сценария
+        async with db_pool.acquire() as _conn:
+            completed_count = await _conn.fetchval(
+                "SELECT COUNT(*) FROM tasks WHERE user_id=$1 AND status='Completed'", user_id
+            )
+        if completed_count and completed_count % 3 == 0:
+            await message.answer(
+                "👥 <b>Кстати!</b> За каждого приглашённого друга — "
+                "<b>25 кредитов</b> в подарок.\n"
+                "Твоя реферальная ссылка в разделе «👥 Реферальная программа» 🎁",
+                parse_mode="HTML",
+            )
 
         # Уведомление о низком балансе
         if new_balance < LOW_BALANCE_THRESHOLD:
