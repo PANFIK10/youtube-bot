@@ -511,6 +511,11 @@ class ScriptMaker(StatesGroup):
     waiting_for_duration = State()
     waiting_for_template = State()
 
+class BulkMaker(StatesGroup):
+    waiting_for_topics   = State()
+    waiting_for_duration = State()
+    waiting_for_template = State()
+
 class TemplateManager(StatesGroup):
     waiting_for_new_name    = State()
     waiting_for_new_prompt  = State()
@@ -522,6 +527,7 @@ class TemplateManager(StatesGroup):
 def get_main_kb():
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="🎬 Создать сценарий")],
+        [KeyboardButton(text="🗂 Массовая генерация")],
         [KeyboardButton(text="💰 Баланс"),   KeyboardButton(text="💳 Пополнить")],
         [KeyboardButton(text="📋 Тарифы"),   KeyboardButton(text="📦 Пакеты")],
         [KeyboardButton(text="📁 Шаблоны"),  KeyboardButton(text="⚙️ Настройки")],
@@ -895,6 +901,203 @@ async def cancel_task_handler(call: types.CallbackQuery):
         ], resize_keyboard=True),
     )
     await call.answer()
+
+# ---------------------------------------------------------------------------
+# МАССОВАЯ ГЕНЕРАЦИЯ
+# ---------------------------------------------------------------------------
+MAX_BULK_SCRIPTS = 5  # максимум сценариев за один раз
+
+@dp.message(F.text == "🗂 Массовая генерация")
+async def bulk_start(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer(
+        f"🗂 <b>Массовая генерация</b>\n\n"
+        f"Введи темы сценариев — каждую с новой строки.\n"
+        f"Максимум <b>{MAX_BULK_SCRIPTS} тем</b>.\n\n"
+        f"<i>Пример:\n"
+        f"Как Маск построил Tesla\n"
+        f"История создания iPhone\n"
+        f"Почему СССР распался</i>",
+        reply_markup=types.ReplyKeyboardRemove(), parse_mode="HTML",
+    )
+    await state.set_state(BulkMaker.waiting_for_topics)
+
+
+@dp.message(BulkMaker.waiting_for_topics)
+async def bulk_topics(message: types.Message, state: FSMContext):
+    if message.text == "🔙 Назад в меню":
+        return await back_to_main(message, state)
+
+    topics = [t.strip() for t in message.text.splitlines() if t.strip()]
+    if not topics:
+        await message.answer("⚠️ Введи хотя бы одну тему.")
+        return
+    if len(topics) > MAX_BULK_SCRIPTS:
+        await message.answer(
+            f"⚠️ Максимум {MAX_BULK_SCRIPTS} тем. "
+            f"Ты ввёл {len(topics)} — оставлю первые {MAX_BULK_SCRIPTS}."
+        )
+        topics = topics[:MAX_BULK_SCRIPTS]
+
+    await state.update_data(topics=topics)
+    await message.answer(
+        f"✅ Принято <b>{len(topics)} тем</b>:\n" +
+        "\n".join(f"  {i+1}. {t}" for i, t in enumerate(topics)) +
+        "\n\nУкажи длительность каждого сценария (мин):",
+        parse_mode="HTML",
+    )
+    await state.set_state(BulkMaker.waiting_for_duration)
+
+
+@dp.message(BulkMaker.waiting_for_duration)
+async def bulk_duration(message: types.Message, state: FSMContext):
+    if not message.text.isdigit() or int(message.text) < 1:
+        await message.answer("⚠️ Введи число, например: <b>60</b>", parse_mode="HTML")
+        return
+
+    duration   = int(message.text)
+    model_id   = await get_user_model(message.from_user.id)
+    model_name = MODEL_NAMES.get(model_id, model_id)
+    data       = await state.get_data()
+    topics     = data["topics"]
+    cost_each  = calc_cost(model_id, duration)
+    cost_total = cost_each * len(topics)
+    balance    = await get_balance(message.from_user.id)
+
+    await state.update_data(duration=duration, words_target=duration * WORDS_PER_MINUTE)
+
+    cost_line = (
+        f"<i>💰 Стоимость: {cost_each:.1f} × {len(topics)} = "
+        f"<b>{cost_total:.1f} кред.</b> | Баланс: <b>{balance:.1f} кред.</b></i>\n\n"
+    )
+
+    if balance < cost_total:
+        await message.answer(
+            f"❌ <b>Недостаточно кредитов</b>\n\n{cost_line}"
+            "Нажми <b>💳 Пополнить</b> чтобы пополнить баланс.",
+            reply_markup=get_main_kb(), parse_mode="HTML",
+        )
+        await state.clear()
+        return
+
+    await message.answer(
+        f"{cost_line}"
+        "<i>⚠️ Хронометраж может отличаться на ±10 мин.</i>\n\nВыбери шаблон:",
+        reply_markup=await get_dynamic_templates_kb(for_generation=True), parse_mode="HTML",
+    )
+    await state.set_state(BulkMaker.waiting_for_template)
+
+
+@dp.message(BulkMaker.waiting_for_template)
+async def bulk_generate(message: types.Message, state: FSMContext):
+    global _active_tasks
+
+    if message.text == "🔙 Назад в меню":
+        return await back_to_main(message, state)
+    if message.text == "➕ Создать новый шаблон":
+        await message.answer("Введите название:", reply_markup=types.ReplyKeyboardRemove())
+        await state.set_state(TemplateManager.waiting_for_new_name)
+        return
+
+    templates = await get_templates()
+    if message.text not in templates:
+        await message.answer(
+            "Выбери из списка:",
+            reply_markup=await get_dynamic_templates_kb(for_generation=True),
+        )
+        return
+
+    style_prompt   = templates[message.text]
+    data           = await state.get_data()
+    topics         = data["topics"]
+    model_id       = await get_user_model(message.from_user.id)
+    friendly_model = MODEL_NAMES.get(model_id, "AI")
+    duration       = data["duration"]
+    words_target   = data["words_target"]
+    user_id        = message.from_user.id
+
+    cost_each  = calc_cost(model_id, duration)
+    cost_total = cost_each * len(topics)
+
+    # Финальная проверка баланса
+    balance = await get_balance(user_id)
+    if balance < cost_total:
+        await message.answer(
+            f"❌ <b>Недостаточно кредитов</b>\n"
+            f"Нужно: <b>{cost_total:.1f}</b> | Баланс: <b>{balance:.1f}</b>",
+            reply_markup=get_main_kb(), parse_mode="HTML",
+        )
+        await state.clear()
+        return
+
+    # Списываем всю сумму сразу
+    await deduct_credits(
+        user_id, cost_total,
+        f"🗂 Массовая генерация {len(topics)} сц. ({friendly_model}, {duration} мин)",
+    )
+
+    await state.clear()
+
+    if _generation_semaphore is None:
+        await message.answer("❌ Бот ещё не готов, попробуй через несколько секунд.")
+        return
+
+    await message.answer(
+        f"🗂 <b>Запускаю {len(topics)} сценариев</b>\n\n"
+        f"Модель: <b>{friendly_model}</b> | Длительность: <b>{duration} мин</b>\n"
+        f"Списано: <b>{cost_total:.1f} кред.</b>\n\n"
+        f"Сценарии будут приходить по одному по мере готовности ☕",
+        reply_markup=get_main_kb(), parse_mode="HTML",
+    )
+
+    # Запускаем все сценарии последовательно в фоне
+    asyncio.create_task(_run_bulk(message, topics, model_id, friendly_model,
+                                  duration, words_target, style_prompt, user_id))
+
+
+async def _run_bulk(message, topics, model_id, friendly_model,
+                    duration, words_target, style_prompt, user_id):
+    """Последовательно генерирует все сценарии из списка."""
+    global _active_tasks
+    total = len(topics)
+    done  = 0
+
+    for i, topic in enumerate(topics):
+        if _generation_semaphore is None:
+            break
+
+        if _active_tasks >= MAX_CONCURRENT_TASKS:
+            await message.answer(
+                f"⏳ Сценарий {i+1}/{total} в очереди — ждёт свободного слота...",
+            )
+
+        await _generation_semaphore.acquire()
+        _active_tasks += 1
+
+        try:
+            await message.answer(
+                f"⏳ <b>Генерирую сценарий {i+1}/{total}</b>: <i>{topic}</i>",
+                parse_mode="HTML",
+            )
+            file_name = await _generate_single(
+                message, topic, model_id, friendly_model,
+                duration, words_target, style_prompt, user_id,
+                task_prefix=f"[Bulk {i+1}/{total}]",
+            )
+            if file_name:
+                done += 1
+        finally:
+            _active_tasks -= 1
+            _generation_semaphore.release()
+
+    balance = await get_balance(user_id)
+    await message.answer(
+        f"✅ <b>Массовая генерация завершена!</b>\n\n"
+        f"Готово: <b>{done}/{total}</b> сценариев\n"
+        f"Остаток баланса: <b>{balance:.1f} кред.</b>",
+        parse_mode="HTML",
+    )
+
 
 # ---------------------------------------------------------------------------
 # СОЗДАНИЕ СЦЕНАРИЯ
@@ -1281,6 +1484,208 @@ async def generate_script(message: types.Message, state: FSMContext):
         await state.clear()
         if os.path.exists(file_name):
             os.remove(file_name)
+
+# ---------------------------------------------------------------------------
+# ОБЩАЯ ФУНКЦИЯ ГЕНЕРАЦИИ ОДНОГО СЦЕНАРИЯ
+# ---------------------------------------------------------------------------
+
+async def _generate_single(
+    message, topic, model_id, friendly_model,
+    duration, words_target, style_prompt, user_id,
+    task_prefix="", deduct=False, cost=0.0,
+) -> bool:
+    task_id   = f"{random.randint(100,999)} {random.randint(100,999)} {random.randint(100,999)}"
+    file_name = f"script_{task_id.replace(' ', '_')}.txt"
+    await log_task(task_id, user_id, topic, friendly_model)
+
+    try:
+        temp_msg = await message.answer("⏳ <i>Подготовка структуры...</i>", parse_mode="HTML")
+        target_chapters = max(1, round(words_target / WORDS_PER_CHAPTER))
+
+        plan_prompt = (
+            f"Составь план YouTube-видео на тему: «{topic}».\n"
+            f"Нужно ровно {target_chapters} пунктов — не больше, не меньше.\n\n"
+            f"ЖЁСТКИЕ ТРЕБОВАНИЯ:\n"
+            f"1. Каждый пункт — отдельный самостоятельный аспект (5–10 слов).\n"
+            f"2. Биография и контекст эпохи — ТОЛЬКО в 1-м пункте.\n"
+            f"3. Каждый пункт отвечает на ДРУГОЙ вопрос (кто/что/почему/как/когда).\n"
+            f"4. Запрещены похожие по смыслу пункты.\n"
+            f"5. Только нумерованный список без пояснений."
+        )
+        plan_raw = await api_call_with_retry(model_id, [{"role": "user", "content": plan_prompt}], 2500)
+        validated = await api_call_with_retry(model_id, [{"role": "user", "content": (
+            f"Вот план ({target_chapters} пунктов):\n\n{plan_raw}\n\n"
+            f"Найди пункты, пересекающиеся по смыслу, перепиши их.\n"
+            f"Верни ровно {target_chapters} пунктов нумерованным списком. "
+            f"Если дублей нет — верни исходный список."
+        )}], 2500)
+        if validated and validated.strip():
+            plan_raw = validated
+
+        chapters = parse_plan_chapters(plan_raw, target_chapters)
+        n        = len(chapters)
+
+        words_per_chapter  = words_target // n
+        overrequest_factor = VOLUME_OVERREQUEST_FACTORS.get(model_id, VOLUME_OVERREQUEST_FACTOR_DEFAULT)
+        words_to_request   = max(50, int(words_per_chapter * overrequest_factor))
+        max_tokens_chapter = min(int(words_to_request * 2.4), 2048)
+        _cta_keywords   = ("cta", "комментар", "призыв", "подписк", "лайк")
+        cta_positions   = compute_cta_positions(n) if any(kw in style_prompt.lower() for kw in _cta_keywords) else set()
+        full_plan_str   = "\n".join(f"{i+1}. {t}" for i, t in enumerate(chapters))
+        chunk_size      = 5
+        total_chunks    = math.ceil(n / chunk_size)
+
+        cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отменить", callback_data=f"cancel_{task_id}")]
+        ])
+        try:
+            await temp_msg.delete()
+        except Exception:
+            pass
+
+        status_msg = await message.answer(
+            build_progress_text(task_id, friendly_model, n, 0, total_chunks),
+            reply_markup=cancel_kb, parse_mode="HTML",
+        )
+
+        full_script_parts: list[str] = [""] * n
+        SEQ_INTRO_CHAPTERS = min(3, n)
+        covered_summary    = ""
+
+        def build_p(index, title, prev_text="", covered="", include_cta=False):
+            cta_i   = "\n5. CTA: В конце — ненавязчивый призыв написать одно слово." if include_cta else ""
+            prev_b  = f"\nПРЕДЫДУЩАЯ ЧАСТЬ (не повторяй):\n{prev_text[-800:]}\n" if prev_text else ""
+            cov_b   = f"\nУЖЕ РАСКРЫТО (нельзя повторять):\n{covered}\n" if covered else ""
+            return (
+                f"Ты пишешь часть сценария для YouTube-видео.\n\nТЕМА: {topic}\n\n"
+                f"ПЛАН ({n} частей):\n{full_plan_str}\n\n"
+                f"ЗАДАЧА: написать ТОЛЬКО часть №{index+1} — «{title}».\n"
+                f"Не повторяй тезисы из других частей.{prev_b}{cov_b}\n"
+                f"ГЛАВНОЕ ТРЕБОВАНИЕ К СТИЛЮ И ПОДАЧЕ (в приоритете):\n{style_prompt}\n\n"
+                f"ТЕХНИЧЕСКИЕ ОГРАНИЧЕНИЯ (обязательны):\n"
+                f"1. ОБЪЁМ: ровно {words_to_request} слов. Никаких пометок.\n"
+                f"2. ФОРМАТ: только сплошной текст. Без заголовков, #, *, ---, списков.\n"
+                f"3. НАЧАЛО: сразу с первого слова.\n"
+                f"4. КОНЕЦ: завершай мысль естественно.{cta_i}"
+            )
+
+        async def gen_one(index, title, prev_text="", covered="", is_regen=False):
+            if await get_task_status(task_id) == "Cancelled":
+                return
+            try:
+                raw   = await api_call_with_retry(
+                    model_id,
+                    [{"role": "user", "content": build_p(
+                        index, title, prev_text, covered,
+                        include_cta=(index in cta_positions) and not is_regen,
+                    )}],
+                    max_tokens_chapter,
+                )
+                full_script_parts[index] = clean_chapter_text(raw) + "\n\n"
+            except Exception as e:
+                logging.error(f"{task_prefix}[{task_id}] ❌ {index+1}: {e}")
+                full_script_parts[index] = ""
+
+        async def get_summary(texts):
+            combined = " ".join(t[:600] for t in texts if t)
+            if not combined.strip():
+                return ""
+            try:
+                return (await api_call_with_retry(
+                    model_id,
+                    [{"role": "user", "content":
+                      f"Перечисли в 3-4 предложениях ключевые тезисы. Только суть:\n\n{combined}"}],
+                    300,
+                )).strip()
+            except Exception:
+                return ""
+
+        done_count = 0
+        for i in range(SEQ_INTRO_CHAPTERS):
+            if await get_task_status(task_id) == "Cancelled":
+                return False
+            await gen_one(i, chapters[i], prev_text=full_script_parts[i-1] if i > 0 else "", covered=covered_summary)
+            done_count += 1
+            await safe_edit(status_msg,
+                build_progress_text(task_id, friendly_model, n, done_count,
+                                    max(0, math.ceil((n - done_count) / chunk_size))),
+                reply_markup=cancel_kb)
+
+        covered_summary = await get_summary([full_script_parts[i] for i in range(SEQ_INTRO_CHAPTERS)])
+
+        for batch_start in range(0, len(range(SEQ_INTRO_CHAPTERS, n)), chunk_size):
+            if await get_task_status(task_id) == "Cancelled":
+                return False
+            batch = list(range(SEQ_INTRO_CHAPTERS, n))[batch_start:batch_start + chunk_size]
+            await asyncio.gather(*[gen_one(i, chapters[i], covered=covered_summary) for i in batch])
+            done_count += len(batch)
+            await safe_edit(status_msg,
+                build_progress_text(task_id, friendly_model, n, done_count,
+                                    max(0, math.ceil((n - done_count) / chunk_size))),
+                reply_markup=cancel_kb)
+            await asyncio.sleep(2)
+            if batch_start + chunk_size < len(list(range(SEQ_INTRO_CHAPTERS, n))):
+                new_sum = await get_summary([full_script_parts[i] for i in batch])
+                if new_sum:
+                    covered_summary = (covered_summary + "\n" + new_sum)[-1200:]
+
+        if await get_task_status(task_id) == "Cancelled":
+            return False
+
+        short_indices = [i for i, p in enumerate(full_script_parts)
+                         if len(p.split()) < words_per_chapter * MIN_CHAPTER_RATIO]
+        if short_indices:
+            await safe_edit(status_msg, build_progress_text(task_id, friendly_model, n, n, 0, phase="regen"), reply_markup=cancel_kb)
+            for _ in range(MAX_REGEN_ATTEMPTS):
+                if not short_indices or await get_task_status(task_id) == "Cancelled":
+                    break
+                await asyncio.gather(*[gen_one(i, chapters[i], covered=covered_summary, is_regen=True) for i in short_indices])
+                await asyncio.sleep(2)
+                short_indices = [i for i in short_indices if len(full_script_parts[i].split()) < words_per_chapter * MIN_CHAPTER_RATIO]
+
+        if await get_task_status(task_id) == "Cancelled":
+            return False
+
+        full_script = re.sub(r'\n{3,}', '\n\n', "".join(full_script_parts).strip())
+        word_count  = len(full_script.split())
+        with open(file_name, "w", encoding="utf-8") as f:
+            f.write(full_script)
+
+        if deduct:
+            await deduct_credits(user_id, cost, f"🎬 Сценарий {task_id} ({friendly_model}, {duration} мин)")
+
+        new_balance = await get_balance(user_id)
+        prefix_str  = "Массовая: " if task_prefix else ""
+        caption = (
+            f"📄 {prefix_str}<i>{topic}</i>\n"
+            f"📊 ~{word_count} слов (~{word_count // WORDS_PER_MINUTE} мин.)\n"
+            f"💰 Баланс: {new_balance:.1f} кред."
+        )
+
+        await safe_edit(status_msg, build_progress_text(task_id, friendly_model, n, n, 0, phase="done"), reply_markup=None)
+        try:
+            await message.answer_document(FSInputFile(file_name), caption=caption)
+        except Exception:
+            backup = await upload_to_backup(file_name)
+            if backup:
+                await message.answer(f"⚠️ <a href='{backup}'>Скачать</a>", parse_mode="HTML")
+
+        await update_task_status(task_id, "Completed")
+        return True
+
+    except Exception as e:
+        logging.error(f"{task_prefix}[{task_id}] Ошибка: {e}")
+        try:
+            await message.answer(f"❌ Ошибка: «{topic}»\n<code>{e}</code>", parse_mode="HTML")
+        except Exception:
+            pass
+        await update_task_status(task_id, f"Error: {str(e)}")
+        return False
+
+    finally:
+        if os.path.exists(file_name):
+            os.remove(file_name)
+
 
 # ---------------------------------------------------------------------------
 # ЗАПУСК
