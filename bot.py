@@ -52,7 +52,9 @@ def _next_client() -> AsyncOpenAI:
 MAX_CONCURRENT_TASKS = 25
 _generation_semaphore: asyncio.Semaphore | None = None
 _active_tasks: int = 0
-_user_tasks: dict[int, int] = {}  # user_id → кол-во активных задач
+_user_tasks: dict[int, int] = {}   # user_id → кол-во активных задач
+_last_message: dict[int, float] = {}  # user_id → timestamp последнего сообщения
+THROTTLE_SECONDS = 0.5  # минимальный интервал между сообщениями от одного пользователя
 
 API_RETRY_ATTEMPTS   = 3
 API_RETRY_BASE_DELAY = 2.0
@@ -71,6 +73,20 @@ async def on_startup():
     _active_tasks = 0
     db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10, ssl="prefer")
     await init_db()
+
+    # Middleware защита от флуда
+    @dp.message.middleware()
+    async def throttle_middleware(handler, event, data):
+        import time
+        user_id = event.from_user.id if event.from_user else None
+        if user_id:
+            now = time.monotonic()
+            last = _last_message.get(user_id, 0)
+            if now - last < THROTTLE_SECONDS:
+                return  # молча игнорируем слишком частые сообщения
+            _last_message[user_id] = now
+        return await handler(event, data)
+
     logging.info(f"Готов | API ключей: {len(API_KEYS)} | Очередь: {MAX_CONCURRENT_TASKS}")
 
 @dp.shutdown()
@@ -111,6 +127,12 @@ MODEL_NAMES = {
 # ---------------------------------------------------------------------------
 USD_TO_RUB = 86.0  # фиксированный курс
 
+MIN_TOPUP_RUB = 100  # минимальная сумма пополнения в рублях
+
+def rub_to_usd(rub: float) -> str:
+    """Переводит рубли в доллары для отображения рядом с ценой."""
+    return f"~${rub / USD_TO_RUB:.2f}"
+
 # Цена в кредитах за минуту (1 кредит = 1 рубль)
 MODEL_PRICE_PER_MINUTE: dict[str, float] = {
     "google/gemini-2.5-flash-lite":  0.15,
@@ -127,6 +149,7 @@ REFERRAL_BONUS_INVITEE_PCT = 10
 
 MAX_TASKS_PER_USER    = 2     # макс. одновременных задач от одного пользователя
 LOW_BALANCE_THRESHOLD = 20.0  # уведомлять если баланс ниже этого порога после генерации
+MAX_SCRIPT_DURATION   = 300   # максимум минут для одного сценария
 
 # Пакеты: (цена ₽, базовых кредитов, бонус кредитов, название)
 CREDIT_PACKAGES = [
@@ -150,6 +173,11 @@ def _now() -> str:
 
 def _gen_ref_code() -> str:
     return "".join(random.choices(string.ascii_uppercase + string.digits, k=8))
+
+
+def _esc(text: str) -> str:
+    """Экранирует спецсимволы HTML чтобы пользовательский ввод не ломал разметку."""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 # ---------------------------------------------------------------------------
 # БАЗА ДАННЫХ
@@ -288,13 +316,21 @@ async def add_credits(user_id: int, amount: float, description: str):
 
 async def deduct_credits(user_id: int, amount: float, description: str):
     async with db_pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE settings SET credits = credits - $1 WHERE user_id=$2", amount, user_id,
+        # CASE защищает от ухода в минус при гонке запросов
+        result = await conn.fetchval(
+            """
+            UPDATE settings
+            SET credits = GREATEST(credits - $1, 0)
+            WHERE user_id = $2
+            RETURNING credits
+            """,
+            amount, user_id,
         )
         await conn.execute(
             "INSERT INTO transactions (user_id, amount, description, created_at) VALUES ($1,$2,$3,$4)",
             user_id, -amount, description, _now(),
         )
+    return float(result or 0)
 
 
 async def get_transactions(user_id: int, limit: int = 7) -> list:
@@ -646,31 +682,44 @@ FAQ_TEXT = (
     "Также работает команда /cancel. Кредиты при отмене не списываются."
 )
 
-TARIFFS_TEXT = (
-    "💰 <b>Тарифы на генерацию</b>\n\n"
-    "Стоимость = <b>цена за минуту × длительность</b>\n"
-    "1 кредит = 1 рубль\n\n"
-    "──────────────────────────\n"
-    "🟢 <b>Gemini</b> — 0.15 кред./мин\n"
-    "30 мин: 4.5₽  |  60 мин: 9₽  |  90 мин: 13.5₽  |  120 мин: 18₽\n\n"
-    "🔵 <b>Grok</b> — 0.25 кред./мин\n"
-    "30 мин: 7.5₽  |  60 мин: 15₽  |  90 мин: 22.5₽  |  120 мин: 30₽\n\n"
-    "🟡 <b>Claude Haiku</b> — 0.75 кред./мин\n"
-    "30 мин: 22.5₽  |  60 мин: 45₽  |  90 мин: 67.5₽  |  120 мин: 90₽\n\n"
-    "🟠 <b>ChatGPT (GPT-5.1)</b> — 1.25 кред./мин\n"
-    "30 мин: 37.5₽  |  60 мин: 75₽  |  90 мин: 112.5₽  |  120 мин: 150₽\n\n"
-    "🔴 <b>Claude Sonnet ✨</b> — 2.00 кред./мин\n"
-    "30 мин: 60₽  |  60 мин: 120₽  |  90 мин: 180₽  |  120 мин: 240₽\n"
-    "──────────────────────────\n\n"
-    "<i>Стоимость показывается перед каждой генерацией.\n"
-    "Кредиты списываются только после успешного завершения.\n"
-    "Если баланса не хватает — генерация не начнётся.</i>"
-)
+def build_tariffs_text() -> str:
+    rates = [
+        ("🟢", "Gemini",          0.15),
+        ("🔵", "Grok",            0.25),
+        ("🟡", "Claude Haiku",    0.75),
+        ("🟠", "ChatGPT (GPT-5.1)", 1.25),
+        ("🔴", "Claude Sonnet ✨", 2.00),
+    ]
+    lines = [
+        "💰 <b>Тарифы на генерацию</b>\n\n"
+        "Стоимость = <b>цена за минуту × длительность</b>\n"
+        "1 кредит = 1 рубль\n\n"
+        "──────────────────────────\n"
+    ]
+    for emoji, name, ppm in rates:
+        lines.append(f"{emoji} <b>{name}</b> — {ppm} кред./мин\n")
+        for mins in [30, 60, 90, 120]:
+            cost = ppm * mins
+            lines.append(f"  {mins} мин: <b>{cost:.1f}₽</b> ({rub_to_usd(cost)})")
+            if mins < 120:
+                lines.append("  |")
+        lines.append("\n\n")
+    lines.append(
+        "──────────────────────────\n\n"
+        "<i>Стоимость показывается перед каждой генерацией.\n"
+        "Кредиты списываются только после успешного завершения.\n"
+        "Если баланса не хватает — генерация не начнётся.</i>"
+    )
+    return "".join(lines)
 
 
 def build_packages_text() -> str:
-    lines = ["📦 <b>Пакеты пополнения</b>\n\n"
-             "Покупай выгоднее — чем больше пакет, тем ниже цена за кредит.\n\n"]
+    lines = [
+        "📦 <b>Пакеты пополнения</b>\n\n"
+        f"Минимальная сумма пополнения: <b>{MIN_TOPUP_RUB}₽</b> "
+        f"({rub_to_usd(MIN_TOPUP_RUB)} USDT)\n"
+        "Покупай выгоднее — чем больше пакет, тем ниже цена за кредит.\n\n"
+    ]
 
     for price, base, bonus, name in CREDIT_PACKAGES:
         total = base + bonus
@@ -678,7 +727,6 @@ def build_packages_text() -> str:
         discount_str = f" (<b>скидка {discount}%</b>)" if discount else ""
         bonus_str    = f" + {bonus} бонус" if bonus else ""
 
-        # Примеры на что хватит
         examples = []
         for mid, ppm in MODEL_PRICE_PER_MINUTE.items():
             mname = MODEL_NAMES[mid].replace(" ✨", "")
@@ -691,7 +739,7 @@ def build_packages_text() -> str:
 
         lines.append(
             f"──────────────────────────\n"
-            f"<b>{name}</b> — {price}₽{discount_str}\n"
+            f"<b>{name}</b> — {price}₽ ({rub_to_usd(price)}){discount_str}\n"
             f"💳 {base}{bonus_str} = <b>{total} кредитов</b>\n"
             f"<i>Например:</i>\n"
         )
@@ -822,8 +870,10 @@ async def pkg_selected(call: types.CallbackQuery):
     total = base + bonus
     await call.message.answer(
         f"📦 Пакет <b>{name}</b>\n"
-        f"💳 Сумма: <b>{price}₽</b>\n"
+        f"💳 Сумма: <b>{price}₽</b> ({rub_to_usd(price)} USDT)\n"
         f"🎁 Получите: <b>{total} кредитов</b>\n\n"
+        f"⚠️ Минимальная сумма пополнения: <b>{MIN_TOPUP_RUB}₽</b> "
+        f"({rub_to_usd(MIN_TOPUP_RUB)} USDT)\n\n"
         f"Для оплаты напишите в <a href='https://t.me/aass11463'>поддержку</a>:\n"
         f"• Пакет: <b>{name}</b>\n"
         f"• Ваш ID: <code>{call.from_user.id}</code>",
@@ -843,7 +893,7 @@ async def faq_cmd(message: types.Message):
 
 @dp.message(F.text == "📋 Тарифы")
 async def tariffs_cmd(message: types.Message):
-    await message.answer(TARIFFS_TEXT, parse_mode="HTML")
+    await message.answer(build_tariffs_text(), parse_mode="HTML")
 
 
 @dp.message(F.text == "📦 Пакеты")
@@ -970,7 +1020,7 @@ async def add_template_prompt(message: types.Message, state: FSMContext):
     if "topic" in data:
         await message.answer(
             f"✅ Шаблон <b>{data['template_name']}</b> сохранён!\n"
-            f"Продолжаем: <i>{data['topic']}</i>. Выберите шаблон:",
+            f"Продолжаем: <i>{_esc(data['topic'])}</i>. Выберите шаблон:",
             reply_markup=await get_dynamic_templates_kb(for_generation=True), parse_mode="HTML",
         )
         await state.set_state(ScriptMaker.waiting_for_template)
@@ -1050,6 +1100,7 @@ async def bulk_topics(message: types.Message, state: FSMContext):
         return await back_to_main(message, state)
 
     topics = [t.strip() for t in message.text.splitlines() if t.strip()]
+    topics = [t[:300] for t in topics]  # обрезаем каждую тему до 300 символов
     if not topics:
         await message.answer("⚠️ Введи хотя бы одну тему.")
         return
@@ -1076,6 +1127,15 @@ async def bulk_duration(message: types.Message, state: FSMContext):
         await message.answer("⚠️ Введи число, например: <b>60</b>", parse_mode="HTML")
         return
 
+    duration = int(message.text)
+    if duration > MAX_SCRIPT_DURATION:
+        await message.answer(
+            f"⚠️ Максимальная длительность — <b>{MAX_SCRIPT_DURATION} минут</b>.\n"
+            f"Введи число от 1 до {MAX_SCRIPT_DURATION}:",
+            parse_mode="HTML",
+        )
+        return
+
     duration   = int(message.text)
     model_id   = await get_user_model(message.from_user.id)
     model_name = MODEL_NAMES.get(model_id, model_id)
@@ -1088,8 +1148,9 @@ async def bulk_duration(message: types.Message, state: FSMContext):
     await state.update_data(duration=duration, words_target=duration * WORDS_PER_MINUTE)
 
     cost_line = (
-        f"<i>💰 Стоимость: {cost_each:.1f} × {len(topics)} = "
-        f"<b>{cost_total:.1f} кред.</b> | Баланс: <b>{balance:.1f} кред.</b></i>\n\n"
+        f"<i>💰 Стоимость: {cost_each:.1f}₽ × {len(topics)} = "
+        f"<b>{cost_total:.1f}₽</b> ({rub_to_usd(cost_total)}) | "
+        f"Баланс: <b>{balance:.1f}₽</b></i>\n\n"
     )
 
     if balance < cost_total:
@@ -1197,7 +1258,7 @@ async def _run_bulk(message, topics, model_id, friendly_model,
 
         try:
             await message.answer(
-                f"⏳ <b>Генерирую сценарий {i+1}/{total}</b>: <i>{topic}</i>",
+                f"⏳ <b>Генерирую сценарий {i+1}/{total}</b>: <i>{_esc(topic)}</i>",
                 parse_mode="HTML",
             )
             file_name = await _generate_single(
@@ -1232,7 +1293,13 @@ async def start_script(message: types.Message, state: FSMContext):
 
 @dp.message(ScriptMaker.waiting_for_topic)
 async def process_topic(message: types.Message, state: FSMContext):
-    await state.update_data(topic=message.text)
+    topic = message.text.strip()
+    if len(topic) > 300:
+        await message.answer(
+            "⚠️ Тема слишком длинная. Сформулируй покороче — до 300 символов."
+        )
+        return
+    await state.update_data(topic=topic)
     await message.answer("Длительность (мин):")
     await state.set_state(ScriptMaker.waiting_for_duration)
 
@@ -1241,6 +1308,15 @@ async def process_topic(message: types.Message, state: FSMContext):
 async def process_duration(message: types.Message, state: FSMContext):
     if not message.text.isdigit() or int(message.text) < 1:
         await message.answer("⚠️ Введите число, например: <b>60</b>", parse_mode="HTML")
+        return
+
+    duration = int(message.text)
+    if duration > MAX_SCRIPT_DURATION:
+        await message.answer(
+            f"⚠️ Максимальная длительность — <b>{MAX_SCRIPT_DURATION} минут</b>.\n"
+            f"Введи число от 1 до {MAX_SCRIPT_DURATION}:",
+            parse_mode="HTML",
+        )
         return
 
     duration    = int(message.text)
@@ -1253,7 +1329,8 @@ async def process_duration(message: types.Message, state: FSMContext):
 
     cost_line = (
         f"<i>💰 Стоимость ({model_name}, {duration} мин): "
-        f"<b>{cost:.1f} кред.</b> | Баланс: <b>{balance:.1f} кред.</b></i>\n\n"
+        f"<b>{cost:.1f}₽</b> ({rub_to_usd(cost)}) | "
+        f"Баланс: <b>{balance:.1f}₽</b></i>\n\n"
     )
 
     if balance < cost:
@@ -1834,7 +1911,7 @@ async def _generate_single(
     except Exception as e:
         logging.error(f"{task_prefix}[{task_id}] Ошибка: {e}")
         try:
-            await message.answer(f"❌ Ошибка: «{topic}»\n<code>{e}</code>", parse_mode="HTML")
+            await message.answer(f"❌ Ошибка: «{_esc(topic)}»\n<code>{_esc(str(e))}</code>", parse_mode="HTML")
         except Exception:
             pass
         await update_task_status(task_id, f"Error: {str(e)}")
