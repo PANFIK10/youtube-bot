@@ -1113,7 +1113,7 @@ async def bulk_topics(message: types.Message, state: FSMContext):
         return await back_to_main(message, state)
 
     topics = [t.strip() for t in message.text.splitlines() if t.strip()]
-    topics = [t[:300] for t in topics]  # обрезаем каждую тему до 300 символов
+    topics = [t[:4096] for t in topics]  # обрезаем каждую тему до 4096 символов
     if not topics:
         await message.answer("⚠️ Введи хотя бы одну тему.")
         return
@@ -1307,9 +1307,9 @@ async def start_script(message: types.Message, state: FSMContext):
 @dp.message(ScriptMaker.waiting_for_topic)
 async def process_topic(message: types.Message, state: FSMContext):
     topic = message.text.strip()
-    if len(topic) > 300:
+    if len(topic) > 4096:
         await message.answer(
-            "⚠️ Тема слишком длинная. Сформулируй покороче — до 300 символов."
+            "⚠️ Тема слишком длинная. Сформулируй покороче — до 4096 символов."
         )
         return
     await state.update_data(topic=topic)
