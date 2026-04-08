@@ -18,6 +18,7 @@ from aiogram.types import (
 from aiogram.exceptions import TelegramBadRequest
 from openai import AsyncOpenAI
 import aiohttp
+import aiohttp.web
 
 # ---------------------------------------------------------------------------
 # КОНФИГУРАЦИЯ
