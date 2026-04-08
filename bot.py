@@ -24,6 +24,9 @@ import aiohttp
 # ---------------------------------------------------------------------------
 TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN")
 DATABASE_URL       = os.getenv("DATABASE_URL")
+CRYPTOBOT_TOKEN    = os.getenv("CRYPTOBOT_TOKEN", "")
+WEBHOOK_HOST       = os.getenv("WEBHOOK_HOST", "")  # https://scriptai.bothost.ru
+CRYPTOBOT_API_URL  = "https://pay.crypt.bot/api"
 
 # Уведомления об ошибках администратору
 _raw_admins = os.getenv("ADMIN_IDS", "")
@@ -191,6 +194,103 @@ async def admin_notify(text: str):
             await bot.send_message(admin_id, text, parse_mode="HTML")
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# CRYPTOBOT — создание инвойсов и обработка вебхуков
+# ---------------------------------------------------------------------------
+
+async def cryptobot_create_invoice(amount_rub: float, user_id: int,
+                                   package_idx: int, description: str) -> dict | None:
+    """Создаёт инвойс в CryptoBot на сумму в рублях."""
+    if not CRYPTOBOT_TOKEN:
+        return None
+    payload = f"{user_id}:{package_idx}"
+    async with aiohttp.ClientSession() as session:
+        try:
+            resp = await session.get(
+                f"{CRYPTOBOT_API_URL}/createInvoice",
+                headers={"Crypto-Pay-API-Token": CRYPTOBOT_TOKEN},
+                params={
+                    "currency_type": "fiat",
+                    "fiat": "RUB",
+                    "amount": str(round(amount_rub, 2)),
+                    "description": description,
+                    "payload": payload,
+                    "paid_btn_name": "openBot",
+                    "paid_btn_url": f"https://t.me/autoscenariobot",
+                    "expires_in": 3600,  # 1 час на оплату
+                },
+            )
+            data = await resp.json()
+            if data.get("ok"):
+                return data["result"]
+        except Exception as e:
+            logging.error(f"CryptoBot createInvoice: {e}")
+    return None
+
+
+async def _verify_cryptobot_signature(body: bytes, signature: str) -> bool:
+    """Проверяет подпись вебхука от CryptoBot."""
+    import hashlib
+    import hmac
+    secret = hashlib.sha256(CRYPTOBOT_TOKEN.encode()).digest()
+    expected = hmac.new(secret, body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, signature)
+
+
+async def cryptobot_webhook_handler(request: aiohttp.web.Request):
+    """Обработчик вебхука от CryptoBot — начисляет кредиты после оплаты."""
+    body = await request.read()
+    signature = request.headers.get("crypto-pay-api-signature", "")
+
+    if not await _verify_cryptobot_signature(body, signature):
+        logging.warning("CryptoBot: неверная подпись вебхука")
+        return aiohttp.web.Response(status=401)
+
+    import json
+    data = json.loads(body)
+
+    if data.get("update_type") != "invoice_paid":
+        return aiohttp.web.Response(text="ok")
+
+    invoice = data.get("payload", {})
+    payload = invoice.get("payload", "")
+
+    try:
+        user_id_str, pkg_idx_str = payload.split(":")
+        user_id  = int(user_id_str)
+        pkg_idx  = int(pkg_idx_str)
+        price, base, bonus, name = CREDIT_PACKAGES[pkg_idx]
+        total = base + bonus
+    except Exception as e:
+        logging.error(f"CryptoBot webhook: ошибка разбора payload: {e}")
+        return aiohttp.web.Response(text="ok")
+
+    # Начисляем кредиты
+    await add_credits(user_id, total, f"💎 Оплата криптой — пакет «{name}»")
+
+    # Обрабатываем реферальный бонус при первом пополнении
+    await process_first_topup(user_id, float(price))
+
+    new_balance = await get_balance(user_id)
+
+    # Уведомляем пользователя
+    try:
+        await bot.send_message(
+            user_id,
+            f"✅ <b>Оплата получена!</b>\n\n"
+            f"📦 Пакет: <b>{name}</b>\n"
+            f"💎 Начислено: <b>{total} кредитов</b>\n"
+            f"💰 Баланс: <b>{new_balance:.1f} кред.</b>\n\n"
+            f"Спасибо! Можешь создавать сценарии 🎬",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logging.error(f"CryptoBot: не удалось уведомить user {user_id}: {e}")
+
+    logging.info(f"CryptoBot: начислено {total} кред. → user {user_id} (пакет {name})")
+    return aiohttp.web.Response(text="ok")
 
 # ---------------------------------------------------------------------------
 # БАЗА ДАННЫХ
@@ -955,8 +1055,8 @@ async def topup_cmd(message: types.Message):
     ])
     await message.answer(
         "💳 <b>Выберите пакет пополнения:</b>\n\n"
-        "<i>Платёжная система подключается — скоро будет автоплатёж.\n"
-        "Пока свяжитесь с поддержкой для ручного пополнения.</i>",
+        "💎 Оплата криптовалютой (USDT, TON, BTC и др.) — доступна сейчас\n"
+        "🏦 Оплата по СБП — скоро",
         reply_markup=kb, parse_mode="HTML",
     )
 
@@ -966,17 +1066,40 @@ async def pkg_selected(call: types.CallbackQuery):
     idx = int(call.data.split("_")[1])
     price, base, bonus, name = CREDIT_PACKAGES[idx]
     total = base + bonus
-    await call.message.answer(
-        f"📦 Пакет <b>{name}</b>\n"
-        f"💳 Сумма: <b>{price}₽</b> ({rub_to_usd(price)} USDT)\n"
-        f"🎁 Получите: <b>{total} кредитов</b>\n\n"
-        f"⚠️ Минимальная сумма пополнения: <b>{MIN_TOPUP_RUB}₽</b> "
-        f"({rub_to_usd(MIN_TOPUP_RUB)} USDT)\n\n"
-        f"Для оплаты напишите в <a href='https://t.me/aass11463'>поддержку</a>:\n"
-        f"• Пакет: <b>{name}</b>\n"
-        f"• Ваш ID: <code>{call.from_user.id}</code>",
-        parse_mode="HTML",
+
+    # Создаём инвойс в CryptoBot
+    invoice = await cryptobot_create_invoice(
+        amount_rub=price,
+        user_id=call.from_user.id,
+        package_idx=idx,
+        description=f"Script AI — пакет «{name}», {total} кредитов",
     )
+
+    if invoice:
+        pay_url = invoice.get("bot_invoice_url", "")
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💎 Оплатить криптой", url=pay_url)],
+        ])
+        await call.message.answer(
+            f"📦 Пакет <b>{name}</b>\n"
+            f"💳 Сумма: <b>{price}₽</b> ({rub_to_usd(price)})\n"
+            f"🎁 Получите: <b>{total} кредитов</b>\n\n"
+            f"Нажми кнопку ниже — откроется оплата через @CryptoBot.\n"
+            f"Можно платить USDT, TON, BTC, ETH и другими монетами.\n"
+            f"<i>Инвойс действует 1 час.</i>",
+            reply_markup=kb, parse_mode="HTML",
+        )
+    else:
+        # CryptoBot недоступен — ручная оплата
+        await call.message.answer(
+            f"📦 Пакет <b>{name}</b>\n"
+            f"💳 Сумма: <b>{price}₽</b> ({rub_to_usd(price)} USDT)\n"
+            f"🎁 Получите: <b>{total} кредитов</b>\n\n"
+            f"Для оплаты напишите в <a href='https://t.me/aass11463'>поддержку</a>:\n"
+            f"• Пакет: <b>{name}</b>\n"
+            f"• Ваш ID: <code>{call.from_user.id}</code>",
+            parse_mode="HTML",
+        )
     await call.answer()
 
 # ---------------------------------------------------------------------------
@@ -2060,6 +2183,30 @@ async def _generate_single(
 # ---------------------------------------------------------------------------
 async def main():
     print("Бот запущен!")
+
+    # Веб-сервер для приёма вебхуков от CryptoBot
+    if CRYPTOBOT_TOKEN and WEBHOOK_HOST:
+        app = aiohttp.web.Application()
+        app.router.add_post("/cryptobot/webhook", cryptobot_webhook_handler)
+        runner = aiohttp.web.AppRunner(app)
+        await runner.setup()
+        site = aiohttp.web.TCPSite(runner, "0.0.0.0", 8080)
+        await site.start()
+        logging.info("Вебхук-сервер запущен на порту 8080")
+
+        # Регистрируем вебхук в CryptoBot при старте
+        webhook_url = f"{WEBHOOK_HOST}/cryptobot/webhook"
+        async with aiohttp.ClientSession() as session:
+            try:
+                await session.get(
+                    f"{CRYPTOBOT_API_URL}/setWebhook",
+                    headers={"Crypto-Pay-API-Token": CRYPTOBOT_TOKEN},
+                    params={"url": webhook_url},
+                )
+                logging.info(f"CryptoBot вебхук зарегистрирован: {webhook_url}")
+            except Exception as e:
+                logging.error(f"CryptoBot setWebhook: {e}")
+
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
