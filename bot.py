@@ -29,6 +29,14 @@ CRYPTOBOT_TOKEN    = os.getenv("CRYPTOBOT_TOKEN", "")
 WEBHOOK_HOST       = os.getenv("WEBHOOK_HOST", "")  # https://scriptai.bothost.ru
 CRYPTOBOT_API_URL  = "https://pay.crypt.bot/api"
 
+# Robokassa
+ROBO_LOGIN         = "ScriptAI"
+ROBO_PASS1         = "kS186seZVJ6hQD6nXLZu"
+ROBO_PASS2         = "PbPO6Akpi4w9I5eiB8lx"
+ROBO_PASS1_TEST    = "bdhKGxys6U6J61pyzDH0"
+ROBO_PASS2_TEST    = "GlhLmh4WHT7IPF06Hg8P"
+ROBO_TEST_USERS    = ADMIN_IDS  # тестовый режим только для админов
+
 # Уведомления об ошибках администратору
 _raw_admins = os.getenv("ADMIN_IDS", "")
 ADMIN_IDS: set[int] = {int(x.strip()) for x in _raw_admins.split(",") if x.strip().isdigit()}
@@ -292,6 +300,97 @@ async def cryptobot_webhook_handler(request: aiohttp.web.Request):
 
     logging.info(f"CryptoBot: начислено {total} кред. → user {user_id} (пакет {name})")
     return aiohttp.web.Response(text="ok")
+
+# ---------------------------------------------------------------------------
+# ROBOKASSA — создание платёжных ссылок и обработка результата
+# ---------------------------------------------------------------------------
+
+def robo_is_test(user_id: int) -> bool:
+    """Тестовый режим только для администраторов."""
+    return user_id in ROBO_TEST_USERS
+
+
+def robo_make_link(amount: float, inv_id: int, desc: str, user_id: int) -> str:
+    """Формирует ссылку на оплату Robokassa."""
+    import hashlib
+    is_test = robo_is_test(user_id)
+    pass1 = ROBO_PASS1_TEST if is_test else ROBO_PASS1
+    sign_str = f"{ROBO_LOGIN}:{amount:.2f}:{inv_id}:{pass1}"
+    signature = hashlib.sha256(sign_str.encode()).hexdigest()
+    base = "https://auth.robokassa.ru/Merchant/Index.aspx"
+    params = (
+        f"MerchantLogin={ROBO_LOGIN}"
+        f"&OutSum={amount:.2f}"
+        f"&InvId={inv_id}"
+        f"&Description={desc}"
+        f"&SignatureValue={signature}"
+        f"&IsTest={'1' if is_test else '0'}"
+        f"&shp_uid={user_id}"
+    )
+    return f"{base}?{params}"
+
+
+def robo_check_result(out_sum: str, inv_id: str, signature: str,
+                      shp_uid: str, is_test: bool) -> bool:
+    """Проверяет подпись Result URL от Robokassa."""
+    import hashlib
+    pass2 = ROBO_PASS2_TEST if is_test else ROBO_PASS2
+    sign_str = f"{out_sum}:{inv_id}:{pass2}:shp_uid={shp_uid}"
+    expected = hashlib.sha256(sign_str.encode()).hexdigest().upper()
+    return expected == signature.upper()
+
+
+async def robokassa_result_handler(request: aiohttp.web.Request):
+    """Обработчик Result URL от Robokassa — начисляет кредиты после оплаты."""
+    import json as _json
+    try:
+        data = dict(await request.post())
+    except Exception:
+        data = dict(request.rel_url.query)
+
+    out_sum   = data.get("OutSum", "")
+    inv_id    = data.get("InvId", "")
+    signature = data.get("SignatureValue", "")
+    shp_uid   = data.get("shp_uid", "")
+    is_test   = data.get("IsTest", "0") == "1"
+
+    logging.info(f"Robokassa result: inv={inv_id} sum={out_sum} uid={shp_uid} test={is_test}")
+
+    if not robo_check_result(out_sum, inv_id, signature, shp_uid, is_test):
+        logging.warning(f"Robokassa: неверная подпись inv={inv_id}")
+        return aiohttp.web.Response(text="bad sign")
+
+    try:
+        user_id = int(shp_uid)
+        # inv_id кодирует индекс пакета: inv_id = user_id * 10 + pkg_idx
+        pkg_idx = int(inv_id) % 10
+        price, base, bonus, name = CREDIT_PACKAGES[pkg_idx]
+        total = base + bonus
+    except Exception as e:
+        logging.error(f"Robokassa: ошибка разбора данных: {e}")
+        return aiohttp.web.Response(text=f"OK{inv_id}")
+
+    await add_credits(user_id, total, f"💳 Оплата СБП — пакет «{name}»")
+    await process_first_topup(user_id, float(price))
+    new_balance = await get_balance(user_id)
+
+    try:
+        test_label = " (тест)" if is_test else ""
+        await bot.send_message(
+            user_id,
+            f"✅ <b>Оплата получена{test_label}!</b>\n\n"
+            f"📦 Пакет: <b>{name}</b>\n"
+            f"💳 Начислено: <b>{total} кредитов</b>\n"
+            f"💰 Баланс: <b>{new_balance:.1f} кред.</b>\n\n"
+            f"Спасибо! Можешь создавать сценарии 🎬",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logging.error(f"Robokassa: не удалось уведомить user {user_id}: {e}")
+
+    logging.info(f"Robokassa: начислено {total} кред. → user {user_id} (пакет {name})")
+    # Robokassa ждёт ответ вида "OK{InvId}"
+    return aiohttp.web.Response(text=f"OK{inv_id}")
 
 # ---------------------------------------------------------------------------
 # БАЗА ДАННЫХ
@@ -1056,51 +1155,64 @@ async def topup_cmd(message: types.Message):
     ])
     await message.answer(
         "💳 <b>Выберите пакет пополнения:</b>\n\n"
-        "💎 Оплата криптовалютой (USDT, TON, BTC и др.) — доступна сейчас\n"
-        "🏦 Оплата по СБП — скоро",
+        "🏦 СБП (Robokassa) — карты, СБП\n"
+        "💎 Крипта — USDT, TON, BTC и др.",
         reply_markup=kb, parse_mode="HTML",
     )
 
 
 @dp.callback_query(F.data.startswith("pkg_"))
 async def pkg_selected(call: types.CallbackQuery):
-    idx = int(call.data.split("_")[1])
+    idx      = int(call.data.split("_")[1])
     price, base, bonus, name = CREDIT_PACKAGES[idx]
-    total = base + bonus
+    total    = base + bonus
+    user_id  = call.from_user.id
+    is_test  = robo_is_test(user_id)
 
-    # Создаём инвойс в CryptoBot
+    # inv_id кодирует пакет: user_id * 10 + pkg_idx (уникален в пределах суток)
+    inv_id   = (user_id % 100000) * 10 + idx
+
+    # Ссылка Robokassa (СБП)
+    robo_url = robo_make_link(
+        amount=float(price),
+        inv_id=inv_id,
+        desc=f"Script AI — {name} {total} кредитов",
+        user_id=user_id,
+    )
+
+    # Создаём инвойс CryptoBot (крипта)
     invoice = await cryptobot_create_invoice(
         amount_rub=price,
-        user_id=call.from_user.id,
+        user_id=user_id,
         package_idx=idx,
         description=f"Script AI — пакет «{name}», {total} кредитов",
     )
 
+    # Формируем кнопки
+    buttons = []
+    if robo_url:
+        label = "🏦 Оплатить по СБП" + (" (тест)" if is_test else "")
+        buttons.append([InlineKeyboardButton(text=label, url=robo_url)])
     if invoice:
         pay_url = invoice.get("bot_invoice_url", "")
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="💎 Оплатить криптой", url=pay_url)],
-        ])
-        await call.message.answer(
-            f"📦 Пакет <b>{name}</b>\n"
-            f"💳 Сумма: <b>{price}₽</b> ({rub_to_usd(price)})\n"
-            f"🎁 Получите: <b>{total} кредитов</b>\n\n"
-            f"Нажми кнопку ниже — откроется оплата через @CryptoBot.\n"
-            f"Можно платить USDT, TON, BTC, ETH и другими монетами.\n"
-            f"<i>Инвойс действует 1 час.</i>",
-            reply_markup=kb, parse_mode="HTML",
-        )
-    else:
-        # CryptoBot недоступен — ручная оплата
-        await call.message.answer(
-            f"📦 Пакет <b>{name}</b>\n"
-            f"💳 Сумма: <b>{price}₽</b> ({rub_to_usd(price)} USDT)\n"
-            f"🎁 Получите: <b>{total} кредитов</b>\n\n"
-            f"Для оплаты напишите в <a href='https://t.me/aass11463'>поддержку</a>:\n"
-            f"• Пакет: <b>{name}</b>\n"
-            f"• Ваш ID: <code>{call.from_user.id}</code>",
-            parse_mode="HTML",
-        )
+        buttons.append([InlineKeyboardButton(text="💎 Оплатить криптой", url=pay_url)])
+
+    if not buttons:
+        buttons.append([InlineKeyboardButton(
+            text="📩 Написать в поддержку",
+            url="https://t.me/aass11463",
+        )])
+
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    test_notice = "\n⚠️ <i>Тестовый режим — деньги не спишутся</i>" if is_test else ""
+    await call.message.answer(
+        f"📦 Пакет <b>{name}</b>\n"
+        f"💳 Сумма: <b>{price}₽</b> ({rub_to_usd(price)})\n"
+        f"🎁 Получите: <b>{total} кредитов</b>\n\n"
+        f"Выбери способ оплаты:{test_notice}",
+        reply_markup=kb, parse_mode="HTML",
+    )
     await call.answer()
 
 # ---------------------------------------------------------------------------
@@ -2189,6 +2301,8 @@ async def main():
     if CRYPTOBOT_TOKEN and WEBHOOK_HOST:
         app = aiohttp.web.Application()
         app.router.add_post("/cryptobot/webhook", cryptobot_webhook_handler)
+        app.router.add_post("/robokassa/result", robokassa_result_handler)
+        app.router.add_get("/robokassa/result", robokassa_result_handler)
         runner = aiohttp.web.AppRunner(app)
         await runner.setup()
         site = aiohttp.web.TCPSite(runner, "0.0.0.0", 8080)
