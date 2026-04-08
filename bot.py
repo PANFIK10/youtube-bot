@@ -325,46 +325,76 @@ def robo_is_test(user_id: int) -> bool:
 
 
 def robo_make_link(amount: float, inv_id: int, desc: str, user_id: int) -> str:
-    """Формирует ссылку на оплату Robokassa с фискальным чеком."""
+    """Возвращает ссылку на наш endpoint который отдаёт POST-форму."""
+    import urllib.parse
+    params = urllib.parse.urlencode({
+        "amount": f"{amount:.2f}",
+        "inv_id": inv_id,
+        "desc": desc,
+        "uid": user_id,
+    })
+    return f"{WEBHOOK_HOST}/robokassa/pay?{params}"
+
+
+def robo_build_form_html(amount: float, inv_id: int, desc: str, user_id: int) -> str:
+    """Строит HTML страницу с автосабмит POST-формой для Robokassa."""
     import hashlib, json, urllib.parse
     is_test = robo_is_test(user_id)
     pass1   = ROBO_PASS1_TEST if is_test else ROBO_PASS1
 
-    # Фискальный чек — самозанятый, НДС не облагается
     receipt_obj = {
-        "items": [
-            {
-                "name": desc[:128],
-                "quantity": 1,
-                "sum": round(amount, 2),
-                "payment_method": "full_payment",
-                "payment_object": "service",
-                "tax": "none",
-            }
-        ]
+        "items": [{
+            "name": desc[:128],
+            "quantity": 1,
+            "sum": round(amount, 2),
+            "payment_method": "full_payment",
+            "payment_object": "service",
+            "tax": "none",
+        }]
     }
-    # Минимизированный JSON без пробелов
     receipt_json    = json.dumps(receipt_obj, ensure_ascii=False, separators=(',', ':'))
-    # URL-encoded версия — используется и в подписи и в параметре
     receipt_encoded = urllib.parse.quote(receipt_json)
 
-    # Подпись: MerchantLogin:OutSum:InvId:Receipt(url-encoded):Пароль#1:Shp_uid=value
+    # Подпись с URL-encoded Receipt
     sign_str  = f"{ROBO_LOGIN}:{amount:.2f}:{inv_id}:{receipt_encoded}:{pass1}:Shp_uid={user_id}"
     signature = hashlib.sha256(sign_str.encode()).hexdigest()
 
-    base = "https://auth.robokassa.ru/Merchant/Index.aspx"
-    params = (
-        f"MerchantLogin={ROBO_LOGIN}"
-        f"&OutSum={amount:.2f}"
-        f"&InvId={inv_id}"
-        f"&Description={urllib.parse.quote(desc[:100])}"
-        f"&Receipt={receipt_encoded}"
-        f"&SignatureValue={signature}"
-        f"&IsTest={'1' if is_test else '0'}"
-        f"&Culture=ru"
-        f"&Shp_uid={user_id}"
-    )
-    return f"{base}?{params}"
+    is_test_val = "1" if is_test else "0"
+
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<title>Переход к оплате...</title></head>
+<body onload="document.forms[0].submit()">
+<p>Переход к оплате...</p>
+<form action="https://auth.robokassa.ru/Merchant/Index.aspx" method="POST">
+  <input type="hidden" name="MerchantLogin" value="{ROBO_LOGIN}">
+  <input type="hidden" name="OutSum" value="{amount:.2f}">
+  <input type="hidden" name="InvId" value="{inv_id}">
+  <input type="hidden" name="Description" value="{desc[:100]}">
+  <input type="hidden" name="Receipt" value="{receipt_encoded}">
+  <input type="hidden" name="SignatureValue" value="{signature}">
+  <input type="hidden" name="IsTest" value="{is_test_val}">
+  <input type="hidden" name="Culture" value="ru">
+  <input type="hidden" name="Shp_uid" value="{user_id}">
+  <input type="submit" value="Оплатить">
+</form>
+</body></html>"""
+
+
+async def robokassa_pay_handler(request: aiohttp.web.Request):
+    """Отдаёт HTML форму с автосабмитом для оплаты через POST."""
+    import urllib.parse
+    params  = request.rel_url.query
+    try:
+        amount  = float(params["amount"])
+        inv_id  = int(params["inv_id"])
+        desc    = params.get("desc", "Script AI")
+        user_id = int(params["uid"])
+    except Exception:
+        return aiohttp.web.Response(text="bad params", status=400)
+
+    html = robo_build_form_html(amount, inv_id, desc, user_id)
+    return aiohttp.web.Response(text=html, content_type="text/html", charset="utf-8")
 
 
 def robo_check_result(out_sum: str, inv_id: str, signature: str,
@@ -2380,6 +2410,7 @@ async def main():
         app.router.add_post("/cryptobot/webhook", cryptobot_webhook_handler)
         app.router.add_post("/robokassa/result", robokassa_result_handler)
         app.router.add_get("/robokassa/result", robokassa_result_handler)
+        app.router.add_get("/robokassa/pay", robokassa_pay_handler)
         runner = aiohttp.web.AppRunner(app)
         await runner.setup()
         site = aiohttp.web.TCPSite(runner, "0.0.0.0", 8080)
