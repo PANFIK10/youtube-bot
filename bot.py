@@ -27,6 +27,10 @@ TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN")
 DATABASE_URL       = os.getenv("DATABASE_URL")
 CRYPTOBOT_TOKEN    = os.getenv("CRYPTOBOT_TOKEN", "")
 WEBHOOK_HOST       = os.getenv("WEBHOOK_HOST", "")  # https://scriptai.bothost.ru
+# Уведомления об ошибках администратору
+_raw_admins = os.getenv("ADMIN_IDS", "")
+ADMIN_IDS: set[int] = {int(x.strip()) for x in _raw_admins.split(",") if x.strip().isdigit()}
+
 CRYPTOBOT_API_URL  = "https://pay.crypt.bot/api"
 
 # Robokassa
@@ -36,10 +40,6 @@ ROBO_PASS2         = "PbPO6Akpi4w9I5eiB8lx"
 ROBO_PASS1_TEST    = "bdhKGxys6U6J61pyzDH0"
 ROBO_PASS2_TEST    = "GlhLmh4WHT7IPF06Hg8P"
 ROBO_TEST_USERS    = ADMIN_IDS  # тестовый режим только для админов
-
-# Уведомления об ошибках администратору
-_raw_admins = os.getenv("ADMIN_IDS", "")
-ADMIN_IDS: set[int] = {int(x.strip()) for x in _raw_admins.split(",") if x.strip().isdigit()}
 
 _raw_keys = [
     os.getenv("OPENROUTER_API_KEY"),
@@ -276,6 +276,20 @@ async def cryptobot_webhook_handler(request: aiohttp.web.Request):
         logging.error(f"CryptoBot webhook: ошибка разбора payload: {e}")
         return aiohttp.web.Response(text="ok")
 
+    # Защита от двойного начисления
+    invoice_id = str(invoice.get("invoice_id", ""))
+    async with db_pool.acquire() as conn:
+        existing = await conn.fetchrow(
+            "SELECT inv_id FROM payments WHERE inv_id=$1", f"crypto_{invoice_id}"
+        )
+        if existing:
+            logging.warning(f"CryptoBot: дубль платежа invoice_id={invoice_id}")
+            return aiohttp.web.Response(text="ok")
+        await conn.execute(
+            "INSERT INTO payments (inv_id, user_id, amount, created_at) VALUES ($1,$2,$3,$4)",
+            f"crypto_{invoice_id}", user_id, float(price), _now(),
+        )
+
     # Начисляем кредиты
     await add_credits(user_id, total, f"💎 Оплата криптой — пакет «{name}»")
 
@@ -370,9 +384,21 @@ async def robokassa_result_handler(request: aiohttp.web.Request):
         logging.error(f"Robokassa: ошибка разбора данных: {e}")
         return aiohttp.web.Response(text=f"OK{inv_id}")
 
+    # Защита от двойного начисления
+    async with db_pool.acquire() as conn:
+        existing = await conn.fetchrow(
+            "SELECT inv_id FROM payments WHERE inv_id=$1", str(inv_id)
+        )
+        if existing:
+            logging.warning(f"Robokassa: дубль платежа inv={inv_id}, игнорируем")
+            return aiohttp.web.Response(text=f"OK{inv_id}")
+        await conn.execute(
+            "INSERT INTO payments (inv_id, user_id, amount, created_at) VALUES ($1,$2,$3,$4)",
+            str(inv_id), user_id, float(out_sum), _now(),
+        )
+
     await add_credits(user_id, total, f"💳 Оплата СБП — пакет «{name}»")
     await process_first_topup(user_id, float(price))
-    new_balance = await get_balance(user_id)
 
     try:
         test_label = " (тест)" if is_test else ""
@@ -444,6 +470,15 @@ async def init_db():
                 user_id     BIGINT,
                 amount      NUMERIC(12,2),
                 description TEXT,
+                created_at  TEXT
+            )
+        """)
+        # Таблица для защиты от двойного начисления
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS payments (
+                inv_id      TEXT PRIMARY KEY,
+                user_id     BIGINT,
+                amount      NUMERIC(12,2),
                 created_at  TEXT
             )
         """)
