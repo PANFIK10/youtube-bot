@@ -35,10 +35,10 @@ CRYPTOBOT_API_URL  = "https://pay.crypt.bot/api"
 
 # Robokassa
 ROBO_LOGIN         = "ScriptAI"
-ROBO_PASS1         = "kS186seZVJ6hQD6nXLZu"
-ROBO_PASS2         = "PbPO6Akpi4w9I5eiB8lx"
-ROBO_PASS1_TEST    = "bdhKGxys6U6J61pyzDH0"
-ROBO_PASS2_TEST    = "GlhLmh4WHT7IPF06Hg8P"
+ROBO_PASS1         = os.getenv("ROBO_PASS1", "")
+ROBO_PASS2         = os.getenv("ROBO_PASS2", "")
+ROBO_PASS1_TEST    = os.getenv("ROBO_PASS1_TEST", "")
+ROBO_PASS2_TEST    = os.getenv("ROBO_PASS2_TEST", "")
 ROBO_TEST_USERS    = ADMIN_IDS  # тестовый режим только для админов
 
 _raw_keys = [
@@ -328,18 +328,22 @@ def robo_make_link(amount: float, inv_id: int, desc: str, user_id: int) -> str:
     """Формирует ссылку на оплату Robokassa."""
     import hashlib
     is_test = robo_is_test(user_id)
-    pass1 = ROBO_PASS1_TEST if is_test else ROBO_PASS1
-    sign_str = f"{ROBO_LOGIN}:{amount:.2f}:{inv_id}:{pass1}"
+    pass1   = ROBO_PASS1_TEST if is_test else ROBO_PASS1
+    # Shp_ параметры в алфавитном порядке включаются в подпись
+    # Формат: MerchantLogin:OutSum:InvId:Пароль#1:Shp_uid=value
+    sign_str  = f"{ROBO_LOGIN}:{amount:.2f}:{inv_id}:{pass1}:Shp_uid={user_id}"
     signature = hashlib.sha256(sign_str.encode()).hexdigest()
     base = "https://auth.robokassa.ru/Merchant/Index.aspx"
+    import urllib.parse
     params = (
         f"MerchantLogin={ROBO_LOGIN}"
         f"&OutSum={amount:.2f}"
         f"&InvId={inv_id}"
-        f"&Description={desc}"
+        f"&Description={urllib.parse.quote(desc)}"
         f"&SignatureValue={signature}"
         f"&IsTest={'1' if is_test else '0'}"
-        f"&shp_uid={user_id}"
+        f"&Culture=ru"
+        f"&Shp_uid={user_id}"
     )
     return f"{base}?{params}"
 
@@ -349,7 +353,8 @@ def robo_check_result(out_sum: str, inv_id: str, signature: str,
     """Проверяет подпись Result URL от Robokassa."""
     import hashlib
     pass2 = ROBO_PASS2_TEST if is_test else ROBO_PASS2
-    sign_str = f"{out_sum}:{inv_id}:{pass2}:shp_uid={shp_uid}"
+    # Формат проверки: OutSum:InvId:Пароль#2:Shp_uid=value
+    sign_str = f"{out_sum}:{inv_id}:{pass2}:Shp_uid={shp_uid}"
     expected = hashlib.sha256(sign_str.encode()).hexdigest().upper()
     return expected == signature.upper()
 
@@ -365,7 +370,7 @@ async def robokassa_result_handler(request: aiohttp.web.Request):
     out_sum   = data.get("OutSum", "")
     inv_id    = data.get("InvId", "")
     signature = data.get("SignatureValue", "")
-    shp_uid   = data.get("shp_uid", "")
+    shp_uid   = data.get("Shp_uid", data.get("shp_uid", ""))
     is_test   = data.get("IsTest", "0") == "1"
 
     logging.info(f"Robokassa result: inv={inv_id} sum={out_sum} uid={shp_uid} test={is_test}")
