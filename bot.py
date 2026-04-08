@@ -325,21 +325,40 @@ def robo_is_test(user_id: int) -> bool:
 
 
 def robo_make_link(amount: float, inv_id: int, desc: str, user_id: int) -> str:
-    """Формирует ссылку на оплату Robokassa."""
-    import hashlib
+    """Формирует ссылку на оплату Robokassa с фискальным чеком."""
+    import hashlib, json, urllib.parse
     is_test = robo_is_test(user_id)
     pass1   = ROBO_PASS1_TEST if is_test else ROBO_PASS1
-    # Shp_ параметры в алфавитном порядке включаются в подпись
-    # Формат: MerchantLogin:OutSum:InvId:Пароль#1:Shp_uid=value
-    sign_str  = f"{ROBO_LOGIN}:{amount:.2f}:{inv_id}:{pass1}:Shp_uid={user_id}"
+
+    # Фискальный чек — самозанятый, НДС не облагается
+    receipt_obj = {
+        "items": [
+            {
+                "name": desc[:128],
+                "quantity": 1,
+                "sum": round(amount, 2),
+                "payment_method": "full_payment",
+                "payment_object": "service",
+                "tax": "none",
+            }
+        ]
+    }
+    # Минимизированный JSON без пробелов
+    receipt_json    = json.dumps(receipt_obj, ensure_ascii=False, separators=(',', ':'))
+    # URL-encoded версия — используется и в подписи и в параметре
+    receipt_encoded = urllib.parse.quote(receipt_json)
+
+    # Подпись: MerchantLogin:OutSum:InvId:Receipt(url-encoded):Пароль#1:Shp_uid=value
+    sign_str  = f"{ROBO_LOGIN}:{amount:.2f}:{inv_id}:{receipt_encoded}:{pass1}:Shp_uid={user_id}"
     signature = hashlib.sha256(sign_str.encode()).hexdigest()
+
     base = "https://auth.robokassa.ru/Merchant/Index.aspx"
-    import urllib.parse
     params = (
         f"MerchantLogin={ROBO_LOGIN}"
         f"&OutSum={amount:.2f}"
         f"&InvId={inv_id}"
-        f"&Description={urllib.parse.quote(desc)}"
+        f"&Description={urllib.parse.quote(desc[:100])}"
+        f"&Receipt={receipt_encoded}"
         f"&SignatureValue={signature}"
         f"&IsTest={'1' if is_test else '0'}"
         f"&Culture=ru"
@@ -361,7 +380,6 @@ def robo_check_result(out_sum: str, inv_id: str, signature: str,
 
 async def robokassa_result_handler(request: aiohttp.web.Request):
     """Обработчик Result URL от Robokassa — начисляет кредиты после оплаты."""
-    import json as _json
     try:
         data = dict(await request.post())
     except Exception:
@@ -376,34 +394,43 @@ async def robokassa_result_handler(request: aiohttp.web.Request):
     logging.info(f"Robokassa result: inv={inv_id} sum={out_sum} uid={shp_uid} test={is_test}")
 
     if not robo_check_result(out_sum, inv_id, signature, shp_uid, is_test):
-        logging.warning(f"Robokassa: неверная подпись inv={inv_id}")
+        logging.warning(f"Robokassa: неверная подпись inv={inv_id} | data={dict(data)}")
         return aiohttp.web.Response(text="bad sign")
 
     try:
         user_id = int(shp_uid)
-        # inv_id кодирует индекс пакета: inv_id = user_id * 10 + pkg_idx
-        pkg_idx = int(inv_id) % 10
+    except Exception as e:
+        logging.error(f"Robokassa: ошибка shp_uid: {e}")
+        return aiohttp.web.Response(text=f"OK{inv_id}")
+
+    # Защита от двойного начисления — берём данные из БД
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT user_id, amount, pkg_idx, paid FROM payments WHERE inv_id=$1",
+            str(inv_id)
+        )
+        if not row:
+            logging.error(f"Robokassa: inv_id={inv_id} не найден в БД")
+            return aiohttp.web.Response(text=f"OK{inv_id}")
+        if row["paid"]:
+            logging.warning(f"Robokassa: дубль платежа inv={inv_id}, игнорируем")
+            return aiohttp.web.Response(text=f"OK{inv_id}")
+        # Помечаем как оплаченный
+        await conn.execute(
+            "UPDATE payments SET paid=TRUE WHERE inv_id=$1", str(inv_id)
+        )
+        pkg_idx = row["pkg_idx"]
+
+    try:
         price, base, bonus, name = CREDIT_PACKAGES[pkg_idx]
         total = base + bonus
     except Exception as e:
-        logging.error(f"Robokassa: ошибка разбора данных: {e}")
+        logging.error(f"Robokassa: неверный pkg_idx={pkg_idx}: {e}")
         return aiohttp.web.Response(text=f"OK{inv_id}")
-
-    # Защита от двойного начисления
-    async with db_pool.acquire() as conn:
-        existing = await conn.fetchrow(
-            "SELECT inv_id FROM payments WHERE inv_id=$1", str(inv_id)
-        )
-        if existing:
-            logging.warning(f"Robokassa: дубль платежа inv={inv_id}, игнорируем")
-            return aiohttp.web.Response(text=f"OK{inv_id}")
-        await conn.execute(
-            "INSERT INTO payments (inv_id, user_id, amount, created_at) VALUES ($1,$2,$3,$4)",
-            str(inv_id), user_id, float(out_sum), _now(),
-        )
 
     await add_credits(user_id, total, f"💳 Оплата СБП — пакет «{name}»")
     await process_first_topup(user_id, float(price))
+    new_balance = await get_balance(user_id)  # ← был баг: переменная не была определена
 
     try:
         test_label = " (тест)" if is_test else ""
@@ -420,7 +447,6 @@ async def robokassa_result_handler(request: aiohttp.web.Request):
         logging.error(f"Robokassa: не удалось уведомить user {user_id}: {e}")
 
     logging.info(f"Robokassa: начислено {total} кред. → user {user_id} (пакет {name})")
-    # Robokassa ждёт ответ вида "OK{InvId}"
     return aiohttp.web.Response(text=f"OK{inv_id}")
 
 # ---------------------------------------------------------------------------
@@ -484,6 +510,8 @@ async def init_db():
                 inv_id      TEXT PRIMARY KEY,
                 user_id     BIGINT,
                 amount      NUMERIC(12,2),
+                pkg_idx     INT DEFAULT -1,
+                paid        BOOLEAN DEFAULT FALSE,
                 created_at  TEXT
             )
         """)
@@ -1209,8 +1237,17 @@ async def pkg_selected(call: types.CallbackQuery):
     user_id  = call.from_user.id
     is_test  = robo_is_test(user_id)
 
-    # inv_id кодирует пакет: user_id * 10 + pkg_idx (уникален в пределах суток)
-    inv_id   = (user_id % 100000) * 10 + idx
+    # inv_id уникален: берём последние 6 цифр unix-времени + индекс пакета
+    import time as _time
+    inv_id   = int(str(int(_time.time()))[-6:]) * 10 + idx
+
+    # Сохраняем маппинг inv_id → user_id + pkg_idx в БД заранее
+    async with db_pool.acquire() as _conn:
+        await _conn.execute(
+            "INSERT INTO payments (inv_id, user_id, amount, pkg_idx, paid, created_at) "
+            "VALUES ($1,$2,$3,$4,FALSE,$5) ON CONFLICT DO NOTHING",
+            str(inv_id), user_id, float(price), idx, _now(),
+        )
 
     # Ссылка Robokassa (СБП)
     robo_url = robo_make_link(
