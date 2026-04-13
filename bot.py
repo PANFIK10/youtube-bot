@@ -873,6 +873,9 @@ def detect_factual_content(topic: str) -> tuple[str, str]:
     clean_topic = lines[0].strip()
     factual     = "\n".join(lines[1:]).strip()
     return clean_topic, factual
+
+
+def get_templates_menu_kb():
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="➕ Добавить шаблон"), KeyboardButton(text="✏️ Изменить шаблон")],
         [KeyboardButton(text="🗑 Удалить шаблон"),  KeyboardButton(text="🔙 Назад в меню")],
@@ -919,6 +922,45 @@ TARIFFS_TEXT = (
     "<i>Стоимость показывается перед каждой генерацией.\n"
     "Кредиты списываются только после успешного завершения.\n"
     "Если баланса не хватает — генерация не начнётся.</i>"
+)
+
+FAQ_TEXT = (
+    "❓ <b>Частые вопросы</b>\n\n"
+    "──────────────────────────\n"
+    "<b>Как создать сценарий?</b>\n"
+    "Нажми «🎬 Создать сценарий», введи тему, выбери жанр, длительность и шаблон.\n\n"
+    "<b>Что такое кредиты?</b>\n"
+    "1 кредит = 1 рубль. Списываются только после успешной генерации.\n"
+    "Стартовый бонус — 50 кредитов бесплатно.\n\n"
+    "<b>Чем отличаются модели?</b>\n"
+    "🟢 Gemini — быстро и дёшево\n"
+    "🔵 Grok — живой и дерзкий стиль\n"
+    "🟡 Claude Haiku — литературный стиль\n"
+    "🟠 ChatGPT — чёткая логика и структура\n"
+    "🔴 Claude Sonnet — наивысшее качество\n\n"
+    "<b>Что такое шаблоны?</b>\n"
+    "Шаблоны задают стиль подачи: документальный, сторителлинг, научпоп и т.д.\n"
+    "Можно создавать свои в разделе «📁 Шаблоны».\n\n"
+    "<b>Что такое массовая генерация?</b>\n"
+    "Позволяет создать до 5 сценариев за один раз по разным темам.\n\n"
+    "<b>Как работает реферальная программа?</b>\n"
+    "Приглашай друзей по своей ссылке — получай 25 кредитов после их первой оплаты.\n\n"
+    "──────────────────────────\n"
+    "По всем вопросам: @aass11463"
+)
+
+OFERTA_TEXT = (
+    "📜 <b>Публичная оферта Script AI</b>\n\n"
+    "Самозанятый: Панферов Кирилл Алексеевич\n"
+    "ИНН: 616810872170\n\n"
+    "Оказываемая услуга: автоматическая генерация текстовых сценариев "
+    "с использованием нейросетевых технологий.\n\n"
+    "Оплата производится в кредитах (1 кредит = 1 рубль). "
+    "Кредиты списываются только после успешного завершения генерации. "
+    "Возврат неиспользованных кредитов осуществляется по запросу.\n\n"
+    "Сгенерированный контент предоставляется «как есть». "
+    "Сервис не несёт ответственности за точность фактических данных в сценариях.\n\n"
+    "📩 kkpanferovvai@gmail.com | 💬 @aass11463"
 )
 
 
@@ -1043,6 +1085,177 @@ async def restart_cmd(message: types.Message, state: FSMContext):
 async def back_to_main(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer("Главное меню:", reply_markup=get_main_kb())
+
+
+@dp.message(F.text == "🏠 Главная")
+async def home_cmd(message: types.Message, state: FSMContext):
+    await state.clear()
+    balance = await get_balance(message.from_user.id)
+    await message.answer(
+        f"🏠 <b>Главное меню</b>\n\n💰 Баланс: <b>{balance:.1f} кредитов</b>",
+        reply_markup=get_main_kb(), parse_mode="HTML",
+    )
+
+
+@dp.message(F.text == "❓ FAQ")
+async def faq_cmd(message: types.Message):
+    await message.answer(FAQ_TEXT, parse_mode="HTML")
+
+
+# ---------------------------------------------------------------------------
+# МАССОВАЯ ГЕНЕРАЦИЯ
+# ---------------------------------------------------------------------------
+
+class BulkMaker(StatesGroup):
+    waiting_for_topics    = State()
+    waiting_for_style     = State()
+    waiting_for_duration  = State()
+    waiting_for_template  = State()
+
+
+@dp.message(F.text == "🗂 Массовая генерация")
+async def bulk_start(message: types.Message, state: FSMContext):
+    await message.answer(
+        "🗂 <b>Массовая генерация</b>\n\n"
+        "Введи темы сценариев — <b>каждая с новой строки</b>, до 5 тем:\n\n"
+        "<i>Пример:\n"
+        "История Tesla\n"
+        "Как работает ChatGPT\n"
+        "Тайны Бермудского треугольника</i>",
+        reply_markup=types.ReplyKeyboardRemove(), parse_mode="HTML",
+    )
+    await state.set_state(BulkMaker.waiting_for_topics)
+
+
+@dp.message(BulkMaker.waiting_for_topics)
+async def bulk_topics(message: types.Message, state: FSMContext):
+    if message.text == "🔙 Назад в меню":
+        return await back_to_main(message, state)
+    topics = [t.strip() for t in message.text.strip().splitlines() if t.strip()]
+    if not topics:
+        await message.answer("⚠️ Введи хотя бы одну тему.")
+        return
+    if len(topics) > 5:
+        topics = topics[:5]
+        await message.answer(f"⚠️ Взяты первые 5 тем из {len(message.text.strip().splitlines())}.")
+    await state.update_data(topics=topics)
+    await message.answer(
+        f"✅ Принято {len(topics)} тем.\n\nВыбери жанр (для всех сразу):",
+        reply_markup=get_style_kb(), parse_mode="HTML",
+    )
+    await state.set_state(BulkMaker.waiting_for_style)
+
+
+@dp.message(BulkMaker.waiting_for_style)
+async def bulk_style(message: types.Message, state: FSMContext):
+    if message.text == "🔙 Назад в меню":
+        return await back_to_main(message, state)
+    if message.text not in STYLE_MAP:
+        await message.answer("Выбери жанр из списка:", reply_markup=get_style_kb())
+        return
+    await state.update_data(script_style=STYLE_MAP[message.text])
+    await message.answer("Длительность каждого сценария (мин):", reply_markup=types.ReplyKeyboardRemove())
+    await state.set_state(BulkMaker.waiting_for_duration)
+
+
+@dp.message(BulkMaker.waiting_for_duration)
+async def bulk_duration(message: types.Message, state: FSMContext):
+    if not message.text.isdigit() or int(message.text) < 1:
+        await message.answer("⚠️ Введи число, например: <b>30</b>", parse_mode="HTML")
+        return
+    duration   = int(message.text)
+    model_id   = await get_user_model(message.from_user.id)
+    data       = await state.get_data()
+    topics     = data["topics"]
+    cost_each  = calc_cost(model_id, duration)
+    cost_total = cost_each * len(topics)
+    balance    = await get_balance(message.from_user.id)
+    model_name = MODEL_NAMES.get(model_id, model_id)
+
+    await state.update_data(duration=duration, words_target=duration * WORDS_PER_MINUTE)
+
+    if balance < cost_total:
+        await message.answer(
+            f"❌ <b>Недостаточно кредитов</b>\n\n"
+            f"Нужно: <b>{cost_total:.1f}</b> ({len(topics)} × {cost_each:.1f})\n"
+            f"Баланс: <b>{balance:.1f}</b>\n\n"
+            "Нажми <b>💳 Пополнить</b> для пополнения.",
+            reply_markup=get_main_kb(), parse_mode="HTML",
+        )
+        await state.clear()
+        return
+
+    await message.answer(
+        f"💰 Итого: <b>{cost_total:.1f} кред.</b> ({len(topics)} × {cost_each:.1f}, {model_name}, {duration} мин)\n"
+        f"Баланс: <b>{balance:.1f} кред.</b>\n\n"
+        "Выбери шаблон (применится ко всем темам):",
+        reply_markup=await get_dynamic_templates_kb(for_generation=True), parse_mode="HTML",
+    )
+    await state.set_state(BulkMaker.waiting_for_template)
+
+
+@dp.message(BulkMaker.waiting_for_template)
+async def bulk_generate(message: types.Message, state: FSMContext):
+    global _active_tasks
+    if message.text == "🔙 Назад в меню":
+        return await back_to_main(message, state)
+    if message.text == "➕ Создать новый шаблон":
+        await message.answer("Введи название:", reply_markup=types.ReplyKeyboardRemove())
+        await state.set_state(TemplateManager.waiting_for_new_name)
+        return
+
+    templates = await get_templates()
+    if message.text not in templates:
+        await message.answer("Выбери из списка:", reply_markup=await get_dynamic_templates_kb(for_generation=True))
+        return
+
+    style_prompt = templates[message.text]
+    data         = await state.get_data()
+    topics       = data["topics"]
+    model_id     = await get_user_model(message.from_user.id)
+    duration     = data["duration"]
+    cost_each    = calc_cost(model_id, duration)
+    cost_total   = cost_each * len(topics)
+    balance      = await get_balance(message.from_user.id)
+
+    if balance < cost_total:
+        await message.answer(
+            f"❌ Баланс изменился. Нужно: <b>{cost_total:.1f}</b>, есть: <b>{balance:.1f}</b>",
+            reply_markup=get_main_kb(), parse_mode="HTML",
+        )
+        await state.clear()
+        return
+
+    await message.answer(
+        f"🚀 Запускаю генерацию <b>{len(topics)}</b> сценариев...\n"
+        f"Каждый будет отправлен по готовности.",
+        reply_markup=get_main_kb(), parse_mode="HTML",
+    )
+    await state.clear()
+
+    for topic in topics:
+        # Подготавливаем данные как для одиночной генерации
+        fake_state_data = {
+            "topic": topic,
+            "factual": "",
+            "script_style": data.get("script_style", "documentary"),
+            "duration": duration,
+            "words_target": duration * WORDS_PER_MINUTE,
+        }
+        task_id   = f"{random.randint(100,999)} {random.randint(100,999)} {random.randint(100,999)}"
+        file_name = f"script_{task_id.replace(' ', '_')}.txt"
+        friendly_model = MODEL_NAMES.get(model_id, "AI")
+
+        if _generation_semaphore is None:
+            await message.answer(f"❌ Ошибка: бот не готов. Тема «{topic}» пропущена.")
+            continue
+
+        await log_task(task_id, message.from_user.id, topic, friendly_model)
+        asyncio.create_task(
+            _run_generation(message, fake_state_data, style_prompt, model_id,
+                            friendly_model, duration, cost_each, task_id, file_name)
+        )
+        await asyncio.sleep(1)  # небольшая пауза между запусками
 
 # ---------------------------------------------------------------------------
 # БАЛАНС
@@ -1429,6 +1642,21 @@ async def generate_script(message: types.Message, state: FSMContext):
             "⏳ <b>Все слоты заняты.</b> Задача в очереди — начнётся автоматически.",
             parse_mode="HTML",
         )
+
+    asyncio.create_task(
+        _run_generation(message, data, style_prompt, model_id,
+                        friendly_model, duration, cost, task_id, file_name)
+    )
+    await state.clear()
+
+
+async def _run_generation(message: types.Message, data: dict, style_prompt: str,
+                          model_id: str, friendly_model: str, duration: int,
+                          cost: float, task_id: str, file_name: str):
+    global _active_tasks
+
+    user_id      = message.from_user.id
+    words_target = data.get("words_target", duration * WORDS_PER_MINUTE)
 
     await _generation_semaphore.acquire()
     _active_tasks += 1
@@ -1831,7 +2059,6 @@ async def generate_script(message: types.Message, state: FSMContext):
     finally:
         _active_tasks -= 1
         _generation_semaphore.release()
-        await state.clear()
         if os.path.exists(file_name):
             os.remove(file_name)
 
