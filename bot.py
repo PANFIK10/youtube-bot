@@ -506,29 +506,39 @@ async def upload_to_backup(file_path: str) -> str | None:
 async def generate_master_doc(model_id: str, topic: str, style_prompt: str, duration_min: int) -> str:
     """
     Генерирует мастер-документ (синопсис) ДО написания глав.
-    Содержит всех персонажей с именами, конфликт, предысторию, развязку.
-    Передаётся в каждую главу как жёсткий каркас истории.
+    Жёстко фиксирует имена, факты, хронологию — передаётся в каждую главу.
     """
     prompt = (
-        f"Ты готовишься написать сценарий для YouTube на тему: «{topic}»\n"
-        f"Стиль и жанр: {style_prompt[:300]}\n"
-        f"Хронометраж: ~{duration_min} минут\n\n"
-        f"Перед написанием сценария создай МАСТЕР-ДОКУМЕНТ истории.\n\n"
-        f"Обязательно укажи:\n"
-        f"1. ПЕРСОНАЖИ: полное имя, возраст, внешность, характер, роль в истории — для каждого\n"
-        f"2. ГЛАВНЫЙ КОНФЛИКТ: суть противостояния или проблемы\n"
-        f"3. ПРЕДЫСТОРИЯ: что произошло до начала истории\n"
-        f"4. КЛЮЧЕВЫЕ СОБЫТИЯ: 3-5 поворотных моментов\n"
-        f"5. РАЗВЯЗКА: чем всё заканчивается\n"
-        f"6. МЕСТО И ВРЕМЯ: где и когда происходит действие\n\n"
-        f"Пиши конкретно и чётко. Это внутренний документ — никакого художественного текста, "
-        f"только структурированные факты. Максимум 400 слов."
+        f"Ты — главный сценарист. Создай МАСТЕР-ДОКУМЕНТ для YouTube-сценария.\n"
+        f"ТЕМА: «{topic}»\n"
+        f"ЖАНР И СТИЛЬ: {style_prompt[:200]}\n"
+        f"ХРОНОМЕТРАЖ: ~{duration_min} минут\n\n"
+        f"ЗАДАЧА: придумай и жёстко зафикси все детали истории. Пиши КОНКРЕТНО, "
+        f"не используй общие фразы типа «опытный врач» или «молодая женщина».\n\n"
+        f"1. ГЛАВНЫЕ ГЕРОИ (минимум 2-3 персонажа):\n"
+        f"   Для каждого укажи: полные ФИО, точный возраст, профессия, "
+        f"   главная черта характера, тайна или боль персонажа.\n"
+        f"   ВАЖНО: имена должны быть уникальными, не повторяться и не путаться между собой.\n\n"
+        f"2. ПРЕДЫСТОРИЯ КОНФЛИКТА:\n"
+        f"   Что произошло в прошлом? Какая тайна лежит в основе истории? "
+        f"   Кто виноват на самом деле? (Конкретные события, даты, имена.)\n\n"
+        f"3. ХРОНОЛОГИЯ СЮЖЕТА:\n"
+        f"   — Завязка: с чего конкретно начинается история\n"
+        f"   — Поворотный момент: неожиданное событие в середине\n"
+        f"   — Кульминация: самый напряжённый момент\n"
+        f"   — Развязка: чем всё заканчивается, какой вывод\n\n"
+        f"4. СЕТТИНГ: конкретный город, место, год или время года.\n\n"
+        f"5. КЛЮЧЕВЫЕ ФАКТЫ КОТОРЫЕ НЕЛЬЗЯ МЕНЯТЬ:\n"
+        f"   Перечисли 5-7 конкретных деталей (имена родственников, даты событий, "
+        f"   названия мест, цифры), которые должны оставаться неизменными во всём сценарии.\n\n"
+        f"Объём: 350-450 слов. Только структурированные факты, никакого художественного текста.\n"
+        f"Этот документ — ЗАКОН для всего сценария. Факты из него менять ЗАПРЕЩЕНО."
     )
     try:
         result = await api_call_with_retry(
             model_id,
             [{"role": "user", "content": prompt}],
-            800,
+            900,
         )
         return result.strip() if result else ""
     except Exception as e:
@@ -1163,54 +1173,54 @@ async def generate_script(message: types.Message, state: FSMContext):
 
         # ── ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ГЕНЕРАЦИИ ──────────────────────────────
         full_script_parts: list[str] = [""] * n
-        SEQ_INTRO_CHAPTERS = min(3, n)
-        covered_summary    = ""
-        project_bible      = ""  # библия извлекается после первых глав (доп. слой)
+        covered_summary = ""
 
-        def build_chapter_prompt(index, title, prev_text="", covered="", bible="", include_cta=False):
+        def build_chapter_prompt(index, title, prev_text="", covered="", include_cta=False):
             cta_instr = (
-                "\n5. CTA: В конце — ненавязчивый призыв написать одно слово в комментариях."
-                if include_cta else "\n5. CTA: В этой части НЕТ призыва."
+                "\nCTA: В самом конце этой части — один ненавязчивый вопрос к зрителям."
+                if include_cta else ""
             )
+            # Мастер-документ — ВСЕГДА первым, с жёсткими разделителями
+            lore_block = (
+                f"╔══════════════════════════════════╗\n"
+                f"║         МАСТЕР-ДОКУМЕНТ          ║\n"
+                f"║  Используй ТОЛЬКО эти имена и    ║\n"
+                f"║  факты. Ничего не придумывай.    ║\n"
+                f"╚══════════════════════════════════╝\n"
+                f"{master_doc}\n"
+                f"════════════════════════════════════\n\n"
+            ) if master_doc else ""
+
             prev_block = (
-                f"\nПРЕДЫДУЩАЯ ЧАСТЬ (не повторяй):\n{prev_text[-800:]}\n"
-                if prev_text else ""
-            )
+                f"КОНЕЦ ПРЕДЫДУЩЕЙ ЧАСТИ (для плавной стыковки):\n"
+                f"...{prev_text[-600:]}\n\n"
+            ) if prev_text else ""
+
             covered_block = (
-                f"\nУЖЕ РАСКРЫТО (нельзя повторять):\n{covered}\n"
-                if covered else ""
-            )
-            # Мастер-документ — главный источник истины для всех глав
-            master_block = (
-                f"\nМАСТЕР-ДОКУМЕНТ (строго соблюдай — имена, факты, события):\n{master_doc}\n"
-                if master_doc else ""
-            )
-            # Библия — дополнительный слой после первых глав
-            bible_block = (
-                f"\nДОПОЛНИТЕЛЬНЫЕ ФАКТЫ ИЗ НАПИСАННОГО:\n{bible}\n"
-                if bible else ""
-            )
+                f"УЖЕ РАСКРЫТО — НЕ ПОВТОРЯТЬ:\n{covered}\n\n"
+            ) if covered else ""
+
             return (
-                f"Ты пишешь часть сценария для YouTube-видео.\n\n"
-                f"ТЕМА: {data['topic']}\n\n"
-                f"ПЛАН ({n} частей):\n{full_plan_str}\n\n"
-                f"ЗАДАЧА: написать ТОЛЬКО часть №{index+1} — «{title}».\n"
-                f"Не повторяй тезисы из других частей."
-                f"{master_block}{bible_block}{prev_block}{covered_block}\n"
+                f"{lore_block}"
+                f"ПЛАН СЦЕНАРИЯ ({n} частей):\n{full_plan_str}\n\n"
+                f"{prev_block}"
+                f"{covered_block}"
+                f"ТВОЯ ЗАДАЧА: напиши ТОЛЬКО часть №{index+1} — «{title}».\n"
+                f"Строго следуй именам и фактам из Мастер-документа выше.\n\n"
                 f"СТИЛЬ: {style_prompt}\n\n"
-                f"ПРАВИЛА:\n"
-                f"1. ОБЪЁМ: ровно {words_to_request} слов. Никаких пометок.\n"
-                f"2. ФОРМАТ: только сплошной текст. Без заголовков, #, *, ---, списков.\n"
-                f"3. НАЧАЛО: сразу с первого слова.\n"
-                f"4. КОНЕЦ: завершай мысль естественно."
+                f"ТЕХНИЧЕСКИЕ ТРЕБОВАНИЯ:\n"
+                f"1. Объём: ровно {words_to_request} слов. Без пометок о количестве.\n"
+                f"2. Формат: сплошной текст. Никаких заголовков, списков, символов #*-.\n"
+                f"3. Начало: сразу с первого слова — без вступлений.\n"
+                f"4. Конец: завершай мысль естественно, не обрывай на полуслове."
                 f"{cta_instr}"
             )
 
-        async def generate_one(index, title, prev_text="", covered="", bible="", is_regen=False):
+        async def generate_one(index, title, prev_text="", covered="", is_regen=False):
             if await get_task_status(task_id) == "Cancelled":
                 return
             prompt = build_chapter_prompt(
-                index, title, prev_text, covered, bible,
+                index, title, prev_text, covered,
                 include_cta=(index in cta_positions) and not is_regen,
             )
             try:
@@ -1239,14 +1249,15 @@ async def generate_script(message: types.Message, state: FSMContext):
                 return ""
 
         # ── ГЕНЕРАЦИЯ ЧАСТЕЙ ───────────────────────────────────────────────
-        done_count = 0
+        done_count     = 0
+        SEQ_CHAPTERS   = min(3, n)  # первые 3 — последовательно для prev_text
 
-        # Последовательно — первые 3 (вводные)
-        for i in range(SEQ_INTRO_CHAPTERS):
+        # Первые главы последовательно — передаём prev_text для плавной стыковки
+        for i in range(SEQ_CHAPTERS):
             if await get_task_status(task_id) == "Cancelled":
                 return
-            prev = full_script_parts[i-1] if i > 0 else ""
-            await generate_one(i, chapters[i], prev_text=prev, covered=covered_summary, bible=project_bible)
+            prev = full_script_parts[i - 1] if i > 0 else ""
+            await generate_one(i, chapters[i], prev_text=prev, covered=covered_summary)
             done_count += 1
             await safe_edit(
                 status_msg,
@@ -1255,19 +1266,19 @@ async def generate_script(message: types.Message, state: FSMContext):
                 reply_markup=cancel_kb,
             )
 
-        # После первых глав — извлекаем только сводку тезисов
+        # После первых глав — сводка уже написанного (антиповтор)
         covered_summary = await get_covered_summary(
-            [full_script_parts[i] for i in range(SEQ_INTRO_CHAPTERS)]
+            [full_script_parts[i] for i in range(SEQ_CHAPTERS)]
         )
 
-        # Параллельно — остальные пачками
-        remaining = list(range(SEQ_INTRO_CHAPTERS, n))
+        # Остальные — параллельно пачками (лор уже в промпте каждой главы)
+        remaining = list(range(SEQ_CHAPTERS, n))
         for batch_start in range(0, len(remaining), chunk_size):
             if await get_task_status(task_id) == "Cancelled":
                 return
             batch = remaining[batch_start:batch_start + chunk_size]
             await asyncio.gather(*[
-                generate_one(i, chapters[i], covered=covered_summary, bible=project_bible) for i in batch
+                generate_one(i, chapters[i], covered=covered_summary) for i in batch
             ])
             done_count += len(batch)
             await safe_edit(
@@ -1302,7 +1313,7 @@ async def generate_script(message: types.Message, state: FSMContext):
                 if not short_indices:
                     break
                 await asyncio.gather(*[
-                    generate_one(i, chapters[i], covered=covered_summary, bible=project_bible, is_regen=True)
+                    generate_one(i, chapters[i], covered=covered_summary, is_regen=True)
                     for i in short_indices
                 ])
                 await asyncio.sleep(2)
