@@ -454,6 +454,50 @@ def compute_cta_positions(total_chapters: int, max_cta: int = MAX_CTA_PER_SCRIPT
     return {round(1 + step * i) for i in range(count)}
 
 
+def strip_cta_from_text(text: str) -> str:
+    """
+    Вырезает CTA-фразы которые модель вставила сама.
+    Ищет паттерны «Напиши в комментарии...», «Поставь лайк...» и т.п.
+    и удаляет их вместе с абзацем.
+    """
+    # Паттерны CTA которые модель генерирует
+    cta_patterns = [
+        r'[Нн]апиши\s+в\s+комментар[иях]+[^.!?\n]{0,200}[.!?\n]?',
+        r'[Нн]апишите\s+в\s+комментар[иях]+[^.!?\n]{0,200}[.!?\n]?',
+        r'[Пп]оставь\s+(лайк|подписку|палец)[^.!?\n]{0,150}[.!?\n]?',
+        r'[Пп]одпишитесь\s+на[^.!?\n]{0,150}[.!?\n]?',
+        r'[Пп]одписывайтесь[^.!?\n]{0,150}[.!?\n]?',
+        r'[Нн]е\s+забудь\s+подпис[а-я]+[^.!?\n]{0,150}[.!?\n]?',
+        r'[Пп]иши\s+в\s+комментар[иях]+[^.!?\n]{0,200}[.!?\n]?',
+        r'[Оо]ставь\s+(своё мнение|комментарий|ответ)[^.!?\n]{0,150}[.!?\n]?',
+        r'[Чч]то\s+думаешь[^.!?\n]{0,150}[.!?\n]?',
+    ]
+    for pattern in cta_patterns:
+        text = re.sub(pattern, '', text)
+    # Убираем пустые строки образовавшиеся после удаления
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+
+def inject_cta(parts: list[str], cta_positions: set[int],
+               style_prompt: str, topic: str) -> list[str]:
+    """
+    Вставляет CTA программно после указанных глав.
+    Генерирует тематический вопрос на основе темы сценария.
+    """
+    if not cta_positions:
+        return parts
+
+    result = list(parts)
+    for idx in sorted(cta_positions):
+        if idx >= len(result) or not result[idx]:
+            continue
+        # Простой CTA — одно предложение в конце главы
+        cta_text = f"\n\nНапиши в комментарии одно слово — что ты думаешь об этом?"
+        result[idx] = result[idx].rstrip() + cta_text + "\n\n"
+    return result
+
+
 def build_progress_text(task_id, friendly_model, total_chapters,
                         done_chapters, remaining_chunks, phase="generate"):
     bar_len = 10
@@ -501,6 +545,101 @@ async def upload_to_backup(file_path: str) -> str | None:
     except Exception as e:
         logging.error(f"Бэкап: {e}")
         return None
+
+
+# Максимум слов для полного прогона полировки за один запрос
+POLISH_CHUNK_WORDS = 2500
+
+async def polish_script(model_id: str, text: str, topic: str,
+                        style_prompt: str, task_id: str) -> str:
+    """
+    Финальная полировка готового сценария.
+    Для коротких (<= POLISH_CHUNK_WORDS) — один запрос на весь текст.
+    Для длинных — прогон по перекрывающимся чанкам с сохранением стыков.
+    """
+    words = text.split()
+    total = len(words)
+    logging.info(f"[{task_id}] ✨ Полировка: {total} слов")
+
+    polish_instruction = (
+        f"Ты — финальный редактор сценария для YouTube.\n"
+        f"ТЕМА: «{topic}»\n"
+        f"СТИЛЬ: {style_prompt[:200]}\n\n"
+        f"ЗАДАЧИ РЕДАКТОРА:\n"
+        f"1. СВЯЗНОСТЬ: убери все места где текст звучит как начало нового видео "
+        f"('Сегодня мы поговорим', 'В этом видео', 'Привет всем'). "
+        f"Замени плавным продолжением предыдущей мысли.\n"
+        f"2. ПОВТОРЫ: найди факты, фразы, идеи которые встречаются дважды — "
+        f"удали или перефразируй второе вхождение.\n"
+        f"3. ПЕРЕХОДЫ: там где между абзацами резкий обрыв — добавь 1-2 слова-мостика "
+        f"('Именно тогда...', 'Но это было только начало...', 'Между тем...').\n"
+        f"4. РИТМ: разбей слишком длинные предложения (>25 слов). "
+        f"Чередуй длинные и короткие для живого звучания.\n\n"
+        f"СТРОГО ЗАПРЕЩЕНО:\n"
+        f"— Менять факты, имена, даты\n"
+        f"— Добавлять новые сюжетные линии\n"
+        f"— Сокращать объём более чем на 10%\n"
+        f"— Добавлять призывы к действию\n\n"
+        f"Верни ТОЛЬКО исправленный текст без комментариев."
+    )
+
+    if total <= POLISH_CHUNK_WORDS:
+        # Короткий — один запрос
+        try:
+            result = await api_call_with_retry(
+                model_id,
+                [{"role": "user", "content": f"{polish_instruction}\n\nТЕКСТ:\n{text}"}],
+                min(int(total * 1.3 * 1.5), 8000),
+            )
+            if result and len(result.split()) > total * 0.7:
+                logging.info(f"[{task_id}] ✨ Полировка завершена ({len(result.split())} слов)")
+                return result.strip()
+        except Exception as e:
+            logging.warning(f"[{task_id}] ✨ Полировка не удалась: {e}")
+        return text
+
+    # Длинный — чанки с перекрытием 200 слов для сохранения контекста стыков
+    chunk_size = POLISH_CHUNK_WORDS
+    overlap    = 200
+    polished_chunks: list[str] = []
+    pos = 0
+
+    while pos < total:
+        chunk_words = words[pos: pos + chunk_size]
+        chunk_text  = " ".join(chunk_words)
+
+        # Передаём хвост предыдущего чанка как контекст (не редактируем его)
+        context_block = ""
+        if polished_chunks:
+            prev_tail = " ".join(polished_chunks[-1].split()[-overlap:])
+            context_block = (
+                f"КОНЕЦ ПРЕДЫДУЩЕГО БЛОКА (только для контекста, не редактировать):\n"
+                f"«...{prev_tail}»\n\n"
+            )
+
+        try:
+            result = await api_call_with_retry(
+                model_id,
+                [{"role": "user", "content":
+                  f"{polish_instruction}\n\n{context_block}ТЕКСТ ДЛЯ РЕДАКТИРОВАНИЯ:\n{chunk_text}"}],
+                min(int(len(chunk_words) * 1.3 * 1.5), 8000),
+            )
+            if result and len(result.split()) > len(chunk_words) * 0.7:
+                polished_chunks.append(result.strip())
+            else:
+                polished_chunks.append(chunk_text)
+        except Exception as e:
+            logging.warning(f"[{task_id}] ✨ Чанк {len(polished_chunks)+1} не отполирован: {e}")
+            polished_chunks.append(chunk_text)
+
+        pos += chunk_size
+        await asyncio.sleep(1)  # небольшая пауза между запросами
+
+    polished = "\n\n".join(polished_chunks)
+    polished = re.sub(r'\n{3,}', '\n\n', polished)
+    logging.info(f"[{task_id}] ✨ Полировка завершена ({len(polished.split())} слов, "
+                 f"{len(polished_chunks)} чанков)")
+    return polished
 
 
 async def generate_master_doc(
@@ -1263,31 +1402,33 @@ async def generate_script(message: types.Message, state: FSMContext):
             if master_doc:
                 logging.info(f"[{task_id}] 📋 Мастер-документ ({script_style}): {len(master_doc.split())} слов")
 
-        # ── ПЛАН ───────────────────────────────────────────────────────────
+        # ── ПЛАН С ЗОНАМИ ОТВЕТСТВЕННОСТИ ──────────────────────────────────
         master_block = f"\nОПИРАЙСЯ СТРОГО НА ЭТОТ СИНОПСИС:\n{master_doc}\n\n" if master_doc else ""
         plan_prompt = (
-            f"Составь план YouTube-видео на тему: «{data['topic']}».\n"
+            f"Составь план для единого сплошного текста YouTube-видео на тему: «{data['topic']}».\n"
             f"Нужно ровно {target_chapters} пунктов — не больше, не меньше.\n"
             f"{master_block}"
-            f"ЖЁСТКИЕ ТРЕБОВАНИЯ:\n"
-            f"1. Каждый пункт — отдельный самостоятельный аспект (5–10 слов).\n"
-            f"2. Биография и контекст эпохи — ТОЛЬКО в 1-м пункте.\n"
-            f"3. Каждый пункт отвечает на ДРУГОЙ вопрос (кто/что/почему/как/когда).\n"
-            f"4. Запрещены похожие по смыслу пункты.\n"
-            f"5. Только нумерованный список без пояснений."
+            f"ТРЕБОВАНИЯ К ПЛАНУ:\n"
+            f"1. Каждый пункт — уникальная зона. Укажи ТОЛЬКО для этого пункта факты/события.\n"
+            f"   Формат каждого пункта: «Заголовок | что именно раскрывается»\n"
+            f"   Пример: «Детство Жириновского | годы 1946-1964, Алма-Ата, отец-юрист»\n"
+            f"2. Пункты выстроены как ЕДИНЫЙ нарратив — каждый вытекает из предыдущего.\n"
+            f"3. Каждый пункт отвечает на ДРУГОЙ вопрос. Не повторять факты между пунктами.\n"
+            f"4. Только нумерованный список."
         )
         plan_raw = await api_call_with_retry(
-            model_id, [{"role": "user", "content": plan_prompt}], 2500,
+            model_id, [{"role": "user", "content": plan_prompt}], 3000,
         )
 
         validate_prompt = (
             f"Вот план ({target_chapters} пунктов):\n\n{plan_raw}\n\n"
-            f"Найди пункты, пересекающиеся по смыслу, перепиши их.\n"
+            f"Найди пункты, пересекающиеся по смыслу или по фактам, перепиши их.\n"
+            f"Убедись что каждый пункт содержит уникальные события/факты.\n"
             f"Верни ровно {target_chapters} пунктов нумерованным списком. "
             f"Если дублей нет — верни исходный список."
         )
         validated = await api_call_with_retry(
-            model_id, [{"role": "user", "content": validate_prompt}], 2500,
+            model_id, [{"role": "user", "content": validate_prompt}], 3000,
         )
         if validated and validated.strip():
             plan_raw = validated
@@ -1323,16 +1464,10 @@ async def generate_script(message: types.Message, state: FSMContext):
 
         # ── ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ГЕНЕРАЦИИ ──────────────────────────────
         full_script_parts: list[str] = [""] * n
-        covered_summary = ""
+        used_facts_tracker = ""  # трекер конкретных фактов — не допускает повторов
 
-        def build_chapter_prompt(index, title, prev_text="", covered="", include_cta=False):
-            cta_instr = (
-                "\nCTA: В самом конце этой части — один короткий вопрос к зрителям (одно предложение)."
-                if include_cta else
-                "\nВАЖНО: В этой части НЕТ призывов к действию, НЕТ вопросов к зрителям, "
-                "НЕТ просьб написать комментарий. Заканчивай мысль — и всё."
-            )
-            # Мастер-документ — ВСЕГДА первым, с жёсткими разделителями
+        def build_chapter_prompt(index, title, prev_text="", used_facts=""):
+            # Мастер-документ — ВСЕГДА первым
             lore_block = (
                 f"╔══════════════════════════════════╗\n"
                 f"║         МАСТЕР-ДОКУМЕНТ          ║\n"
@@ -1343,73 +1478,79 @@ async def generate_script(message: types.Message, state: FSMContext):
                 f"════════════════════════════════════\n\n"
             ) if master_doc else ""
 
+            # Хвост предыдущей части — для бесшовного перехода
             prev_block = (
-                f"КОНЕЦ ПРЕДЫДУЩЕЙ ЧАСТИ (для плавной стыковки):\n"
-                f"...{prev_text[-600:]}\n\n"
+                f"ТАК ЗАКАНЧИВАЕТСЯ ПРЕДЫДУЩАЯ ЧАСТЬ (продолжи с этой точки):\n"
+                f"«...{prev_text[-800:]}»\n\n"
             ) if prev_text else ""
 
-            covered_block = (
-                f"УЖЕ РАСКРЫТО — НЕ ПОВТОРЯТЬ:\n{covered}\n\n"
-            ) if covered else ""
+            # Конкретные факты которые уже были — не повторять
+            facts_block = (
+                f"УЖЕ ИСПОЛЬЗОВАННЫЕ ФАКТЫ — НЕ ПОВТОРЯТЬ:\n{used_facts}\n\n"
+            ) if used_facts else ""
+
+            # Зона текущей части — что именно писать
+            current_zone = title  # содержит «Заголовок | что раскрывается»
 
             return (
                 f"{lore_block}"
-                f"ПЛАН СЦЕНАРИЯ ({n} частей):\n{full_plan_str}\n\n"
+                f"ПЛАН ВСЕГО СЦЕНАРИЯ ({n} частей):\n{full_plan_str}\n\n"
                 f"{prev_block}"
-                f"{covered_block}"
-                f"ТВОЯ ЗАДАЧА: напиши ТОЛЬКО часть №{index+1} — «{title}».\n"
-                f"Строго следуй именам и фактам из Мастер-документа выше.\n\n"
+                f"{facts_block}"
+                f"СЕЙЧАС ПИШЕШЬ: часть №{index+1} из {n} — «{current_zone}»\n\n"
+                f"ГЛАВНОЕ ПРАВИЛО: этот текст — фрагмент единого сплошного повествования. "
+                f"Не начинай с нуля. Не делай вводных предложений типа 'Сегодня мы поговорим'. "
+                f"Продолжай историю там, где она прервалась. "
+                f"В конце не подводи итог — оборви на интересном месте чтобы читатель хотел продолжения.\n\n"
                 f"СТИЛЬ: {style_prompt}\n\n"
                 f"ТЕХНИЧЕСКИЕ ТРЕБОВАНИЯ:\n"
-                f"1. Объём: ровно {words_to_request} слов. Без пометок о количестве.\n"
-                f"2. Формат: сплошной текст. Никаких заголовков, списков, символов #*-.\n"
-                f"3. Начало: сразу с первого слова — без вступлений.\n"
-                f"4. Конец: завершай мысль естественно, не обрывай на полуслове."
-                f"{cta_instr}"
+                f"1. Объём: ровно {words_to_request} слов.\n"
+                f"2. Формат: сплошной текст без заголовков, списков, символов #*-.\n"
+                f"3. ЗАПРЕЩЕНО: вступления, подведение итогов, призывы к зрителям, "
+                f"повтор фактов из списка выше."
             )
 
-        async def generate_one(index, title, prev_text="", covered="", is_regen=False):
+        async def generate_one(index, title, prev_text="", used_facts="", is_regen=False):
             if await get_task_status(task_id) == "Cancelled":
                 return
-            prompt = build_chapter_prompt(
-                index, title, prev_text, covered,
-                include_cta=(index in cta_positions) and not is_regen,
-            )
+            prompt = build_chapter_prompt(index, title, prev_text, used_facts)
             try:
                 raw   = await api_call_with_retry(
                     model_id, [{"role": "user", "content": prompt}], max_tokens_chapter,
                 )
-                clean = clean_chapter_text(raw)
+                clean = strip_cta_from_text(clean_chapter_text(raw))
                 full_script_parts[index] = clean + "\n\n"
                 logging.info(f"[{task_id}] ✅ {index+1}/{n} — {len(clean.split())} слов")
             except Exception as e:
                 logging.error(f"[{task_id}] ❌ {index+1}: {e}")
                 full_script_parts[index] = ""
 
-        async def get_covered_summary(texts):
-            combined = " ".join(t[:1500] for t in texts if t)
+        async def extract_used_facts(texts: list[str]) -> str:
+            """Извлекает конкретные факты/имена/даты из уже написанных частей."""
+            combined = " ".join(t[:2000] for t in texts if t)
             if not combined.strip():
                 return ""
             try:
                 return (await api_call_with_retry(
                     model_id,
                     [{"role": "user", "content":
-                      f"Перечисли в 5-6 предложениях ключевые тезисы и факты. Только суть:\n\n{combined}"}],
-                    600,
+                      f"Выпиши КОНКРЕТНЫЕ факты из текста: имена, даты, цифры, названия мест, "
+                      f"ключевые события. Каждый факт — одной строкой. Без пояснений.\n\n{combined}"}],
+                    500,
                 )).strip()
             except Exception:
                 return ""
 
         # ── ГЕНЕРАЦИЯ ЧАСТЕЙ ───────────────────────────────────────────────
-        done_count     = 0
-        SEQ_CHAPTERS   = min(6, n)  # первые 6 — последовательно для prev_text и связности
+        done_count         = 0
+        SEQ_CHAPTERS       = min(6, n)  # первые 6 — последовательно
 
-        # Первые главы последовательно — передаём prev_text для плавной стыковки
+        # Первые главы последовательно — prev_text для бесшовного перехода
         for i in range(SEQ_CHAPTERS):
             if await get_task_status(task_id) == "Cancelled":
                 return
             prev = full_script_parts[i - 1] if i > 0 else ""
-            await generate_one(i, chapters[i], prev_text=prev, covered=covered_summary)
+            await generate_one(i, chapters[i], prev_text=prev, used_facts=used_facts_tracker)
             done_count += 1
             await safe_edit(
                 status_msg,
@@ -1417,20 +1558,19 @@ async def generate_script(message: types.Message, state: FSMContext):
                                     max(0, math.ceil((n - done_count) / chunk_size))),
                 reply_markup=cancel_kb,
             )
+            # Обновляем трекер фактов после каждой главы
+            new_facts = await extract_used_facts([full_script_parts[i]])
+            if new_facts:
+                used_facts_tracker = (used_facts_tracker + "\n" + new_facts)[-2000:]
 
-        # После первых глав — сводка уже написанного (антиповтор)
-        covered_summary = await get_covered_summary(
-            [full_script_parts[i] for i in range(SEQ_CHAPTERS)]
-        )
-
-        # Остальные — параллельно пачками (лор уже в промпте каждой главы)
+        # Остальные — параллельно пачками
         remaining = list(range(SEQ_CHAPTERS, n))
         for batch_start in range(0, len(remaining), chunk_size):
             if await get_task_status(task_id) == "Cancelled":
                 return
             batch = remaining[batch_start:batch_start + chunk_size]
             await asyncio.gather(*[
-                generate_one(i, chapters[i], covered=covered_summary) for i in batch
+                generate_one(i, chapters[i], used_facts=used_facts_tracker) for i in batch
             ])
             done_count += len(batch)
             await safe_edit(
@@ -1440,10 +1580,11 @@ async def generate_script(message: types.Message, state: FSMContext):
                 reply_markup=cancel_kb,
             )
             await asyncio.sleep(2)
+            # Обновляем трекер после каждой пачки
             if batch_start + chunk_size < len(remaining):
-                new_sum = await get_covered_summary([full_script_parts[i] for i in batch])
-                if new_sum:
-                    covered_summary = (covered_summary + "\n" + new_sum)[-1200:]
+                new_facts = await extract_used_facts([full_script_parts[i] for i in batch])
+                if new_facts:
+                    used_facts_tracker = (used_facts_tracker + "\n" + new_facts)[-2000:]
 
         if await get_task_status(task_id) == "Cancelled":
             return
@@ -1465,7 +1606,7 @@ async def generate_script(message: types.Message, state: FSMContext):
                 if not short_indices:
                     break
                 await asyncio.gather(*[
-                    generate_one(i, chapters[i], covered=covered_summary, is_regen=True)
+                    generate_one(i, chapters[i], used_facts=used_facts_tracker, is_regen=True)
                     for i in short_indices
                 ])
                 await asyncio.sleep(2)
@@ -1479,11 +1620,27 @@ async def generate_script(message: types.Message, state: FSMContext):
             return
 
         # ── СБОРКА ─────────────────────────────────────────────────────────
-        full_script = "".join(full_script_parts).strip()
+        assembled_parts = inject_cta(full_script_parts, cta_positions, style_prompt, data['topic'])
+        full_script = "".join(assembled_parts).strip()
         full_script = re.sub(r'\n{3,}', '\n\n', full_script)
         word_count  = len(full_script.split())
         deviation   = word_count - words_target
         logging.info(f"[{task_id}] 📊 {word_count} слов | цель {words_target} | {deviation:+d}")
+
+        # ── ФИНАЛЬНАЯ ПОЛИРОВКА ─────────────────────────────────────────────
+        await safe_edit(
+            status_msg,
+            f"⏳ <b>Генерация сценария</b>\n\n"
+            f"🆔 ID: <code>{task_id}</code>\n"
+            f"🤖 Модель: <b>{friendly_model}</b>\n\n"
+            f"[▓▓▓▓▓▓▓▓▓▓] 100%\n"
+            f"✨ <i>Финальная полировка текста...</i>",
+            reply_markup=None,
+        )
+        full_script = await polish_script(
+            model_id, full_script, data['topic'], style_prompt, task_id
+        )
+        word_count = len(full_script.split())
 
         with open(file_name, "w", encoding="utf-8") as f:
             f.write(full_script)
