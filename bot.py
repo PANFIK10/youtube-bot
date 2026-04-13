@@ -84,13 +84,13 @@ WORDS_PER_MINUTE  = 130
 WORDS_PER_CHAPTER = 400
 
 VOLUME_OVERREQUEST_FACTORS: dict[str, float] = {
-    "anthropic/claude-haiku-4.5":    1.45,
-    "anthropic/claude-sonnet-4.6":   1.30,
-    "openai/gpt-5.1":                0.83,
-    "google/gemini-2.5-flash-lite":  1.25,
-    "x-ai/grok-4.1-fast":            1.25,
+    "anthropic/claude-haiku-4.5":    1.75,
+    "anthropic/claude-sonnet-4.6":   1.65,
+    "openai/gpt-5.1":                1.00,
+    "google/gemini-2.5-flash-lite":  1.55,
+    "x-ai/grok-4.1-fast":            1.55,
 }
-VOLUME_OVERREQUEST_FACTOR_DEFAULT = 1.20
+VOLUME_OVERREQUEST_FACTOR_DEFAULT = 1.50
 
 MIN_CHAPTER_RATIO  = 0.80
 MAX_REGEN_ATTEMPTS = 2
@@ -135,9 +135,16 @@ CREDIT_PACKAGES = [
 
 
 def calc_cost(model_id: str, duration_min: int) -> float:
-    """Стоимость генерации в кредитах, округление вверх до 0.5."""
+    """Максимальная стоимость (резерв) — по запрошенной длительности. Округление вверх до 0.5."""
     price_per_min = MODEL_PRICE_PER_MINUTE.get(model_id, 1.0)
     return math.ceil(price_per_min * duration_min * 2) / 2
+
+
+def calc_cost_by_words(model_id: str, word_count: int) -> float:
+    """Фактическая стоимость — по реальному количеству слов в сценарии. Округление вверх до 0.5."""
+    price_per_min = MODEL_PRICE_PER_MINUTE.get(model_id, 1.0)
+    actual_minutes = word_count / WORDS_PER_MINUTE
+    return math.ceil(price_per_min * actual_minutes * 2) / 2
 
 
 def _now() -> str:
@@ -411,7 +418,8 @@ async def api_call_with_retry(model_id: str, messages: list, max_tokens: int) ->
 
 def clean_chapter_text(text: str) -> str:
     text = re.sub(r'^[-*_=~]{3,}\s*$', '', text, flags=re.MULTILINE)
-    text = re.sub(r'^#{1,6}\s+.*$', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^#{1,6}[\s#].*$', '', text, flags=re.MULTILINE)   # # комментарии модели
+    text = re.sub(r'^#\s*[А-ЯЁA-Z][^\n]{0,80}$', '', text, flags=re.MULTILINE)  # # Единый отрывок и т.п.
     text = re.sub(
         r'^(Глава|Часть|Раздел|Блок|Chapter|Part|Section)\s*[\dIVXivxабвгАБВГ]*[.:\-–—)]*\s*.*$',
         '', text, flags=re.MULTILINE | re.IGNORECASE,
@@ -424,6 +432,10 @@ def clean_chapter_text(text: str) -> str:
         '', text, flags=re.MULTILINE | re.IGNORECASE,
     )
     text = re.sub(r'^\[?\(?\d{2,4}\s*(слов|words|сл\.)\)?\]?\s*$', '', text, flags=re.MULTILINE)
+    # Слипшиеся слова: строчная кириллица + заглавная без пробела (артефакт стыков)
+    text = re.sub(r'([а-яё])([А-ЯЁ])', r'\1 \2', text)
+    # Латинские буквы внутри кириллических слов (напр. Акupрессура → Акупрессура)
+    text = re.sub(r'([а-яёА-ЯЁ])([a-zA-Z])([а-яёА-ЯЁ])', r'\1\3', text)
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
 
@@ -1174,6 +1186,14 @@ async def bulk_duration(message: types.Message, state: FSMContext):
 
     await state.update_data(duration=duration, words_target=duration * WORDS_PER_MINUTE)
 
+    disclaimer = (
+        f"ℹ️ <b>Как считается хронометраж</b>\n"
+        f"Расчёт идёт из <b>{WORDS_PER_MINUTE} слов/мин</b> — средний темп озвучки.\n"
+        f"Каждый диктор говорит в своём темпе. Рекомендуем закладывать "
+        f"на <b>10–15 мин больше</b> желаемого хронометража.\n"
+        f"Списывается фактически — по словам в готовом сценарии.\n\n"
+    )
+
     if balance < cost_total:
         await message.answer(
             f"❌ <b>Недостаточно кредитов</b>\n\n"
@@ -1186,8 +1206,9 @@ async def bulk_duration(message: types.Message, state: FSMContext):
         return
 
     await message.answer(
-        f"💰 Итого: <b>{cost_total:.1f} кред.</b> ({len(topics)} × {cost_each:.1f}, {model_name}, {duration} мин)\n"
-        f"Баланс: <b>{balance:.1f} кред.</b>\n\n"
+        f"{disclaimer}"
+        f"💰 Макс. итого: <b>{cost_total:.1f} кред.</b> ({len(topics)} × {cost_each:.1f}, {model_name}, {duration} мин)\n"
+        f"Баланс: <b>{balance:.1f} кред.</b> | Списывается по факту.\n\n"
         "Выбери шаблон (применится ко всем темам):",
         reply_markup=await get_dynamic_templates_kb(for_generation=True), parse_mode="HTML",
     )
@@ -1561,12 +1582,21 @@ async def process_duration(message: types.Message, state: FSMContext):
     cost        = calc_cost(model_id, duration)
     balance     = await get_balance(message.from_user.id)
     model_name  = MODEL_NAMES.get(model_id, model_id)
+    words_est   = duration * WORDS_PER_MINUTE
 
-    await state.update_data(duration=duration, words_target=duration * WORDS_PER_MINUTE)
+    await state.update_data(duration=duration, words_target=words_est)
 
     cost_line = (
-        f"<i>💰 Стоимость ({model_name}, {duration} мин): "
-        f"<b>{cost:.1f} кред.</b> | Баланс: <b>{balance:.1f} кред.</b></i>\n\n"
+        f"<i>💰 Макс. стоимость ({model_name}, {duration} мин): "
+        f"<b>{cost:.1f} кред.</b> | Баланс: <b>{balance:.1f} кред.</b>\n"
+        f"Списывается фактически — по количеству слов в готовом сценарии.</i>\n\n"
+    )
+
+    disclaimer = (
+        f"ℹ️ <b>Как считается хронометраж</b>\n"
+        f"Расчёт идёт из <b>{WORDS_PER_MINUTE} слов/мин</b> — средний темп озвучки.\n"
+        f"Каждый диктор говорит в своём темпе: кто-то быстрее, кто-то медленнее.\n"
+        f"Рекомендуем закладывать на <b>10–15 мин больше</b> желаемого хронометража.\n\n"
     )
 
     if balance < cost:
@@ -1579,8 +1609,9 @@ async def process_duration(message: types.Message, state: FSMContext):
         return
 
     await message.answer(
+        f"{disclaimer}"
         f"{cost_line}"
-        "<i>⚠️ Хронометраж может отличаться на ±10 мин.</i>\n\nВыбери шаблон:",
+        "Выбери шаблон:",
         reply_markup=await get_dynamic_templates_kb(for_generation=True), parse_mode="HTML",
     )
     await state.set_state(ScriptMaker.waiting_for_template)
@@ -1715,7 +1746,7 @@ async def _run_generation(message: types.Message, data: dict, style_prompt: str,
         words_per_chapter  = words_target // n
         overrequest_factor = VOLUME_OVERREQUEST_FACTORS.get(model_id, VOLUME_OVERREQUEST_FACTOR_DEFAULT)
         words_to_request   = max(50, int(words_per_chapter * overrequest_factor))
-        max_tokens_chapter = min(int(words_to_request * 2.4), 2048)
+        max_tokens_chapter = min(int(words_to_request * 2.4), 4096)
         # CTA только если пользователь явно упомянул это в шаблоне
         _cta_keywords = ("cta", "комментар", "призыв", "подписк", "лайк",
                          "вопрос к зрител", "байт", "одно слово", "комментари")
@@ -1874,9 +1905,26 @@ async def _run_generation(message: types.Message, data: dict, style_prompt: str,
                         return
                     stitched_words = stitched.split()
                     mid = len(stitched_words) // 2
-                    result[i]     = " ".join(words_a[:-HALF] + stitched_words[:mid])
-                    result[i + 1] = " ".join(stitched_words[mid:] + words_b[HALF:])
-                    logging.info(f"[{task_id}] 🔗 Стык {i+1}↔{i+2} сглажен")
+                    new_tail = " ".join(stitched_words[:mid])
+                    new_head = " ".join(stitched_words[mid:])
+
+                    # Дедупликация: убираем из new_head слова которые уже есть в new_tail
+                    tail_set = set(new_tail.lower().split()[-40:])
+                    head_words = new_head.split()
+                    # Пропускаем начало new_head пока оно дублирует конец new_tail (до 30 слов)
+                    skip = 0
+                    for w_idx in range(min(30, len(head_words))):
+                        window = " ".join(head_words[w_idx:w_idx + 8]).lower()
+                        if all(w in tail_set for w in window.split()[:4]):
+                            skip = w_idx + 1
+                    if skip:
+                        new_head = " ".join(head_words[skip:])
+
+                    result[i]     = " ".join(words_a[:-HALF]) + " " + new_tail
+                    result[i + 1] = new_head + " " + " ".join(words_b[HALF:])
+                    result[i]     = result[i].strip()
+                    result[i + 1] = result[i + 1].strip()
+                    logging.info(f"[{task_id}] 🔗 Стык {i+1}↔{i+2} сглажен (skip={skip})")
                 except Exception as e:
                     logging.warning(f"[{task_id}] Стык {i+1}: {e}")
 
@@ -1897,11 +1945,19 @@ async def _run_generation(message: types.Message, data: dict, style_prompt: str,
             model_id, chapters, master_doc, data['topic'], style_prompt, task_id
         )
 
-        # ── ГЕНЕРАЦИЯ ЧАСТЕЙ: полностью последовательно ────────────────────
-        done_count      = 0
-        narrative_state = ""  # нарративный контекст, обновляется после каждой главы
+        # ── ГЕНЕРАЦИЯ ЧАСТЕЙ: якорь + цепочно-параллельная генерация ─────────
+        # Первые SEQ_ANCHOR глав — строго последовательно (закладывают мир).
+        # Остальные — параллельные цепочки по CHAIN_SIZE глав каждая.
+        # Внутри цепочки связность через prev_text, между цепочками — через
+        # общую сводку нарратива (narrative_summary).
+        SEQ_ANCHOR = min(6, n)
+        CHAIN_SIZE = 3
 
-        for i in range(n):
+        done_count      = 0
+        narrative_state = ""
+
+        # ── Фаза 1: якорные главы последовательно ──────────────────────────
+        for i in range(SEQ_ANCHOR):
             if await get_task_status(task_id) == "Cancelled":
                 return
             prev = full_script_parts[i - 1] if i > 0 else ""
@@ -1918,12 +1974,102 @@ async def _run_generation(message: types.Message, data: dict, style_prompt: str,
                                     max(0, n - done_count)),
                 reply_markup=cancel_kb,
             )
-            # Обновляем нарративный стейт — заменяем целиком, не накапливаем
             new_state = await extract_narrative_state(
                 full_script_parts[i], i, chapters[i]
             )
             if new_state:
                 narrative_state = new_state
+
+        # ── Сводка нарратива после якоря — используется всеми цепочками ───
+        async def build_narrative_summary(parts_so_far: list[str]) -> str:
+            """Краткая сводка всего написанного — общий контекст для параллельных цепочек."""
+            combined = " ".join(p[-1500:] for p in parts_so_far if p)
+            if not combined.strip():
+                return narrative_state
+            try:
+                return (await api_call_with_retry(
+                    model_id,
+                    [{"role": "user", "content":
+                      f"Ты — сценарный редактор. Написана первая часть сценария.\n"
+                      f"Составь сводку для авторов следующих глав.\n\n"
+                      f"НАПИСАННОЕ:\n{combined[-4000:]}\n\n"
+                      f"Ответь в формате (до 300 слов):\n"
+                      f"ГДЕ МЫ: [текущая точка сюжета, 2-3 предложения]\n"
+                      f"ПЕРСОНАЖИ: [активные герои и их статус]\n"
+                      f"ОТКРЫТЫЕ ЛИНИИ: [что ещё не разрешено]\n"
+                      f"НЕЛЬЗЯ ПОВТОРЯТЬ: [5-7 фактов/фраз уже прозвучавших]\n"
+                      f"ТОН: [эмоциональный тон финала якорных глав]"}],
+                    600,
+                )).strip()
+            except Exception:
+                return narrative_state
+
+        # ── Фаза 2: параллельные цепочки ───────────────────────────────────
+        remaining = list(range(SEQ_ANCHOR, n))
+
+        if remaining:
+            narrative_summary = await build_narrative_summary(
+                full_script_parts[:SEQ_ANCHOR]
+            )
+
+            async def run_chain(chain_indices: list[int]):
+                """Одна цепочка: главы генерируются последовательно внутри цепочки."""
+                chain_narrative = narrative_summary  # общая сводка как стартовый контекст
+                for idx in chain_indices:
+                    if await get_task_status(task_id) == "Cancelled":
+                        return
+                    # prev_text — предыдущая глава ВНУТРИ цепочки, если есть
+                    chain_pos = chain_indices.index(idx)
+                    if chain_pos > 0:
+                        prev = full_script_parts[chain_indices[chain_pos - 1]]
+                    else:
+                        # Первая глава цепочки — берём хвост последней якорной главы
+                        prev = full_script_parts[SEQ_ANCHOR - 1] if SEQ_ANCHOR > 0 else ""
+                    await generate_one(
+                        idx, chapters[idx],
+                        prev_text=prev,
+                        narrative_state=chain_narrative,
+                        mini_brief=mini_briefs[idx] if idx < len(mini_briefs) else "",
+                    )
+                    # Обновляем нарратив внутри цепочки
+                    new_state = await extract_narrative_state(
+                        full_script_parts[idx], idx, chapters[idx]
+                    )
+                    if new_state:
+                        chain_narrative = new_state
+
+            # Разбиваем remaining на цепочки и запускаем параллельно батчами
+            PARALLEL_CHAINS = 3  # сколько цепочек идут одновременно
+            chain_idx = 0
+            while chain_idx < len(remaining):
+                if await get_task_status(task_id) == "Cancelled":
+                    return
+
+                # Нарезаем следующий батч цепочек
+                batch_chains = []
+                for _ in range(PARALLEL_CHAINS):
+                    start = chain_idx
+                    end   = min(start + CHAIN_SIZE, len(remaining))
+                    if start >= len(remaining):
+                        break
+                    batch_chains.append(remaining[start:end])
+                    chain_idx = end
+
+                await asyncio.gather(*[run_chain(c) for c in batch_chains])
+
+                done_count = sum(1 for p in full_script_parts if p)
+                await safe_edit(
+                    status_msg,
+                    build_progress_text(task_id, friendly_model, n, done_count,
+                                        max(0, n - done_count)),
+                    reply_markup=cancel_kb,
+                )
+
+                # Обновляем общую сводку между батчами
+                if chain_idx < len(remaining):
+                    narrative_summary = await build_narrative_summary(
+                        [p for p in full_script_parts if p]
+                    )
 
         if await get_task_status(task_id) == "Cancelled":
             return
@@ -2002,15 +2148,24 @@ async def _run_generation(message: types.Message, data: dict, style_prompt: str,
         with open(file_name, "w", encoding="utf-8") as f:
             f.write(full_script)
 
-        # Списываем кредиты
-        await deduct_credits(user_id, cost, f"🎬 Сценарий {task_id} ({friendly_model}, {duration} мин)")
+        # Фактическая стоимость — по реальному количеству слов
+        actual_cost     = calc_cost_by_words(model_id, word_count)
+        actual_minutes  = round(word_count / WORDS_PER_MINUTE, 1)
+        saving          = round(cost - actual_cost, 1)
+
+        await deduct_credits(
+            user_id, actual_cost,
+            f"🎬 Сценарий {task_id} ({friendly_model}, ~{actual_minutes} мин. / {word_count} слов)"
+        )
         new_balance = await get_balance(user_id)
+
+        saving_str = f"\n💚 Сэкономлено: <b>{saving:.1f} кред.</b>" if saving > 0 else ""
 
         caption = (
             f"📄 Сценарий ID: {task_id}\n"
-            f"📊 ~{word_count} слов (~{word_count // WORDS_PER_MINUTE} мин.)\n"
-            f"🎯 Цель: {words_target} слов ({duration} мин.)\n"
-            f"💰 Списано: {cost:.1f} кред. | Остаток: {new_balance:.1f} кред."
+            f"📊 {word_count} слов ≈ {actual_minutes} мин. при {WORDS_PER_MINUTE} сл/мин\n"
+            f"🎯 Запрошено: {duration} мин. | Сгенерировано: ~{actual_minutes} мин.\n"
+            f"💰 Списано: {actual_cost:.1f} кред. (по факту) | Остаток: {new_balance:.1f} кред."
         )
 
         await safe_edit(
@@ -2036,7 +2191,8 @@ async def _run_generation(message: types.Message, data: dict, style_prompt: str,
         await update_task_status(task_id, "Completed")
 
         await message.answer(
-            f"✅ Готово! Списано <b>{cost:.1f} кред.</b> | Остаток: <b>{new_balance:.1f} кред.</b>\n\n"
+            f"✅ Готово! Списано <b>{actual_cost:.1f} кред.</b> (по факту){saving_str}\n"
+            f"Остаток: <b>{new_balance:.1f} кред.</b>\n\n"
             "Создать ещё один?",
             reply_markup=ReplyKeyboardMarkup(keyboard=[
                 [KeyboardButton(text="🎬 Создать сценарий")],
