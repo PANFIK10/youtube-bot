@@ -503,35 +503,36 @@ async def upload_to_backup(file_path: str) -> str | None:
         return None
 
 
-async def extract_project_bible(model_id: str, topic: str, chapters_text: str) -> str:
+async def generate_master_doc(model_id: str, topic: str, style_prompt: str, duration_min: int) -> str:
     """
-    Извлекает «библию проекта» из первых глав:
-    имена персонажей, ключевые факты, место/время действия, хронологию.
-    Возвращает компактный текст (~400 слов) который прикрепляется к каждой следующей главе.
+    Генерирует мастер-документ (синопсис) ДО написания глав.
+    Содержит всех персонажей с именами, конфликт, предысторию, развязку.
+    Передаётся в каждую главу как жёсткий каркас истории.
     """
-    if not chapters_text.strip():
-        return ""
     prompt = (
-        f"Проанализируй начало сценария на тему «{topic}» и составь БИБЛИЮ ПРОЕКТА.\n\n"
-        f"ТЕКСТ:\n{chapters_text[:3000]}\n\n"
-        f"Составь структурированный список:\n"
-        f"1. ПЕРСОНАЖИ: имя, возраст/описание, роль в истории (каждого)\n"
-        f"2. МЕСТО ДЕЙСТВИЯ: где происходят события\n"
-        f"3. ВРЕМЯ: эпоха, период, даты если есть\n"
-        f"4. КЛЮЧЕВЫЕ ФАКТЫ: важные детали которые нельзя менять\n"
-        f"5. ТЕРМИНОЛОГИЯ: специфические термины, названия\n\n"
-        f"Пиши кратко и чётко. Только факты из текста, ничего не придумывай.\n"
-        f"Максимум 300 слов."
+        f"Ты готовишься написать сценарий для YouTube на тему: «{topic}»\n"
+        f"Стиль и жанр: {style_prompt[:300]}\n"
+        f"Хронометраж: ~{duration_min} минут\n\n"
+        f"Перед написанием сценария создай МАСТЕР-ДОКУМЕНТ истории.\n\n"
+        f"Обязательно укажи:\n"
+        f"1. ПЕРСОНАЖИ: полное имя, возраст, внешность, характер, роль в истории — для каждого\n"
+        f"2. ГЛАВНЫЙ КОНФЛИКТ: суть противостояния или проблемы\n"
+        f"3. ПРЕДЫСТОРИЯ: что произошло до начала истории\n"
+        f"4. КЛЮЧЕВЫЕ СОБЫТИЯ: 3-5 поворотных моментов\n"
+        f"5. РАЗВЯЗКА: чем всё заканчивается\n"
+        f"6. МЕСТО И ВРЕМЯ: где и когда происходит действие\n\n"
+        f"Пиши конкретно и чётко. Это внутренний документ — никакого художественного текста, "
+        f"только структурированные факты. Максимум 400 слов."
     )
     try:
         result = await api_call_with_retry(
             model_id,
             [{"role": "user", "content": prompt}],
-            600,
+            800,
         )
         return result.strip() if result else ""
     except Exception as e:
-        logging.warning(f"Библия проекта: не удалось извлечь: {e}")
+        logging.warning(f"Мастер-документ: не удалось создать: {e}")
         return ""
 
 # ---------------------------------------------------------------------------
@@ -546,6 +547,7 @@ class TemplateManager(StatesGroup):
     waiting_for_new_name    = State()
     waiting_for_new_prompt  = State()
     waiting_for_delete_name = State()
+    waiting_for_edit_name   = State()   # отдельное состояние для редактирования
 
 # ---------------------------------------------------------------------------
 # КЛАВИАТУРЫ
@@ -553,11 +555,12 @@ class TemplateManager(StatesGroup):
 def get_main_kb():
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="🎬 Создать сценарий")],
+        [KeyboardButton(text="🗂 Массовая генерация")],
         [KeyboardButton(text="💰 Баланс"),   KeyboardButton(text="💳 Пополнить")],
         [KeyboardButton(text="📋 Тарифы"),   KeyboardButton(text="📦 Пакеты")],
         [KeyboardButton(text="📁 Шаблоны"),  KeyboardButton(text="⚙️ Настройки")],
         [KeyboardButton(text="👥 Реферальная программа")],
-        [KeyboardButton(text="🔄 Перезапустить")],
+        [KeyboardButton(text="❓ FAQ"),       KeyboardButton(text="🏠 Главная")],
     ], resize_keyboard=True)
 
 def get_models_kb():
@@ -662,12 +665,36 @@ def build_packages_text() -> str:
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message, state: FSMContext):
     await state.clear()
-    user_id = message.from_user.id
-    args    = message.text.split()
-    user    = await get_or_create_user(user_id)
+    user_id  = message.from_user.id
+    username = message.from_user.username
+    args     = message.text.split()
 
-    # Реферальный код в параметре /start
+    # Проверяем существовал ли пользователь ДО вызова get_or_create_user
+    async with db_pool.acquire() as conn:
+        existing = await conn.fetchrow("SELECT user_id, credits, first_topup FROM settings WHERE user_id=$1", user_id)
+    is_new = existing is None
+
+    user = await get_or_create_user(user_id)
+
+    if username:
+        async with db_pool.acquire() as conn:
+            await conn.execute("UPDATE settings SET username=$1 WHERE user_id=$2", username.lower(), user_id)
+
+    # /start oferta
     if len(args) > 1:
+        if args[1].lower() == "oferta":
+            await message.answer(
+                "📜 <b>Публичная оферта Script AI</b>\n\n"
+                "Самозанятый: Панферов Кирилл Алексеевич\n"
+                "ИНН: 616810872170\n"
+                "📩 kkpanferovvai@gmail.com | 💬 @aass11463",
+                parse_mode="HTML",
+            )
+            try:
+                await message.answer_document(FSInputFile("oferta_scriptai.docx"), caption="Полный текст договора-оферты")
+            except Exception:
+                await message.answer(OFERTA_TEXT, parse_mode="HTML")
+            return
         applied = await apply_referral(user_id, args[1])
         if applied:
             await message.answer(
@@ -677,10 +704,28 @@ async def start_cmd(message: types.Message, state: FSMContext):
             )
 
     balance = float(user["credits"] or 0)
-    await message.answer(
-        WELCOME_TEXT + f"\n\n💰 Ваш баланс: <b>{balance:.1f} кредитов</b>",
-        reply_markup=get_main_kb(), parse_mode="HTML",
-    )
+
+    if is_new:
+        welcome = (
+            "👋 <b>Добро пожаловать в Авто Сценарист!</b>\n\n"
+            "Генерируй готовые YouTube-сценарии за минуты — "
+            "без копирайтеров, без ограничений по длине, без склеек.\n\n"
+            "✨ <b>Почему выбирают нас:</b>\n"
+            "⚡ Сценарий на 60 минут — за 3-5 минут\n"
+            "🗂 Массовая генерация — до 5 сценариев за раз\n"
+            "🤖 5 топовых моделей — GPT, Claude, Gemini, Grok\n"
+            "💰 От 9₽ за полный 60-минутный сценарий\n\n"
+            f"🎁 Тебе начислено <b>{WELCOME_CREDITS} стартовых кредитов</b>!\n\n"
+            f"💰 Ваш баланс: <b>{balance:.1f} кредитов</b>"
+        )
+    else:
+        welcome = (
+            "👋 <b>С возвращением!</b>\n\n"
+            "Готов создавать новые сценарии — жми кнопку и поехали 🚀\n\n"
+            f"💰 Баланс: <b>{balance:.1f} кредитов</b>"
+        )
+
+    await message.answer(welcome, reply_markup=get_main_kb(), parse_mode="HTML")
 
 
 @dp.message(F.text == "🔄 Перезапустить")
@@ -851,8 +896,27 @@ async def add_template_start(message: types.Message, state: FSMContext):
 
 @dp.message(F.text == "✏️ Изменить шаблон")
 async def edit_template_start(message: types.Message, state: FSMContext):
-    await message.answer("Какой изменить?", reply_markup=await get_dynamic_templates_kb())
-    await state.set_state(TemplateManager.waiting_for_new_name)
+    await message.answer("Какой шаблон хочешь изменить?", reply_markup=await get_dynamic_templates_kb())
+    await state.set_state(TemplateManager.waiting_for_edit_name)
+
+
+@dp.message(TemplateManager.waiting_for_edit_name)
+async def edit_template_pick(message: types.Message, state: FSMContext):
+    if message.text == "🔙 Назад в меню":
+        return await back_to_main(message, state)
+    templates = await get_templates()
+    if message.text not in templates:
+        await message.answer("Выбери из списка:", reply_markup=await get_dynamic_templates_kb())
+        return
+    current_prompt = templates[message.text]
+    await state.update_data(template_name=message.text)
+    await message.answer(
+        f"✏️ Шаблон: <b>{message.text}</b>\n\n"
+        f"📄 Текущий промпт:\n<blockquote>{current_prompt}</blockquote>\n\n"
+        f"Отправь новый текст промпта:",
+        reply_markup=types.ReplyKeyboardRemove(), parse_mode="HTML",
+    )
+    await state.set_state(TemplateManager.waiting_for_new_prompt)
 
 
 @dp.message(TemplateManager.waiting_for_new_name)
@@ -1034,12 +1098,21 @@ async def generate_script(message: types.Message, state: FSMContext):
     try:
         temp_msg = await message.answer("⏳ <i>Подготовка структуры...</i>", parse_mode="HTML")
 
-        # ── ПЛАН ───────────────────────────────────────────────────────────
+        # ── МАСТЕР-ДОКУМЕНТ (синопсис) — генерируется ДО плана ─────────────
         target_chapters = max(1, round(words_target / WORDS_PER_CHAPTER))
+        master_doc      = ""
+        # Синопсис нужен только для длинных сценариев (>3 глав) или нарративных жанров
+        if target_chapters > 3:
+            master_doc = await generate_master_doc(model_id, data['topic'], style_prompt, duration)
+            if master_doc:
+                logging.info(f"[{task_id}] 📋 Мастер-документ: {len(master_doc.split())} слов")
 
+        # ── ПЛАН ───────────────────────────────────────────────────────────
+        master_block = f"\nОПИРАЙСЯ СТРОГО НА ЭТОТ СИНОПСИС:\n{master_doc}\n\n" if master_doc else ""
         plan_prompt = (
             f"Составь план YouTube-видео на тему: «{data['topic']}».\n"
-            f"Нужно ровно {target_chapters} пунктов — не больше, не меньше.\n\n"
+            f"Нужно ровно {target_chapters} пунктов — не больше, не меньше.\n"
+            f"{master_block}"
             f"ЖЁСТКИЕ ТРЕБОВАНИЯ:\n"
             f"1. Каждый пункт — отдельный самостоятельный аспект (5–10 слов).\n"
             f"2. Биография и контекст эпохи — ТОЛЬКО в 1-м пункте.\n"
@@ -1092,7 +1165,7 @@ async def generate_script(message: types.Message, state: FSMContext):
         full_script_parts: list[str] = [""] * n
         SEQ_INTRO_CHAPTERS = min(3, n)
         covered_summary    = ""
-        project_bible      = ""  # библия проекта — извлекается после первых глав
+        project_bible      = ""  # библия извлекается после первых глав (доп. слой)
 
         def build_chapter_prompt(index, title, prev_text="", covered="", bible="", include_cta=False):
             cta_instr = (
@@ -1107,8 +1180,14 @@ async def generate_script(message: types.Message, state: FSMContext):
                 f"\nУЖЕ РАСКРЫТО (нельзя повторять):\n{covered}\n"
                 if covered else ""
             )
+            # Мастер-документ — главный источник истины для всех глав
+            master_block = (
+                f"\nМАСТЕР-ДОКУМЕНТ (строго соблюдай — имена, факты, события):\n{master_doc}\n"
+                if master_doc else ""
+            )
+            # Библия — дополнительный слой после первых глав
             bible_block = (
-                f"\nБИБЛИЯ ПРОЕКТА (строго соблюдай — имена, факты, детали):\n{bible}\n"
+                f"\nДОПОЛНИТЕЛЬНЫЕ ФАКТЫ ИЗ НАПИСАННОГО:\n{bible}\n"
                 if bible else ""
             )
             return (
@@ -1117,7 +1196,7 @@ async def generate_script(message: types.Message, state: FSMContext):
                 f"ПЛАН ({n} частей):\n{full_plan_str}\n\n"
                 f"ЗАДАЧА: написать ТОЛЬКО часть №{index+1} — «{title}».\n"
                 f"Не повторяй тезисы из других частей."
-                f"{bible_block}{prev_block}{covered_block}\n"
+                f"{master_block}{bible_block}{prev_block}{covered_block}\n"
                 f"СТИЛЬ: {style_prompt}\n\n"
                 f"ПРАВИЛА:\n"
                 f"1. ОБЪЁМ: ровно {words_to_request} слов. Никаких пометок.\n"
@@ -1176,15 +1255,10 @@ async def generate_script(message: types.Message, state: FSMContext):
                 reply_markup=cancel_kb,
             )
 
-        # После первых глав — извлекаем сводку и библию проекта
+        # После первых глав — извлекаем только сводку тезисов
         covered_summary = await get_covered_summary(
             [full_script_parts[i] for i in range(SEQ_INTRO_CHAPTERS)]
         )
-        if n > SEQ_INTRO_CHAPTERS:
-            intro_text    = "".join(full_script_parts[:SEQ_INTRO_CHAPTERS])
-            project_bible = await extract_project_bible(model_id, data['topic'], intro_text)
-            if project_bible:
-                logging.info(f"[{task_id}] 📖 Библия: {len(project_bible.split())} слов")
 
         # Параллельно — остальные пачками
         remaining = list(range(SEQ_INTRO_CHAPTERS, n))
