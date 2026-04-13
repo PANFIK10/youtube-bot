@@ -765,6 +765,54 @@ async def generate_master_doc(
         logging.warning(f"Мастер-документ: не удалось создать: {e}")
         return ""
 
+
+async def generate_mini_briefs(
+    model_id: str, chapters: list[str], master_doc: str,
+    topic: str, style_prompt: str, task_id: str
+) -> list[str]:
+    """
+    Для каждой главы генерирует мини-бриф одним запросом:
+    что начать, что раскрыть, на чём оборвать (крючок для следующей части).
+    """
+    full_plan = "\n".join(f"{i+1}. {t}" for i, t in enumerate(chapters))
+    master_block = f"\nСИНОПСИС:\n{master_doc}\n" if master_doc else ""
+    n = len(chapters)
+
+    prompt = (
+        f"Ты — главный редактор. Составь мини-бриф для каждой из {n} частей сценария.\n"
+        f"ТЕМА: «{topic}»\n"
+        f"СТИЛЬ: {style_prompt[:150]}\n"
+        f"{master_block}\n"
+        f"ПЛАН:\n{full_plan}\n\n"
+        f"Для КАЖДОЙ части напиши строго в формате:\n"
+        f"[N] НАЧАЛО: [с какой мысли/события начать, подхватывая предыдущую часть]\n"
+        f"    СУТЬ: [главное что раскрыть, 1-2 предложения]\n"
+        f"    КРЮЧОК: [на чём оборвать — вопрос или напряжение без ответа]\n\n"
+        f"Не пиши текст сценария. Только структурированные бриф-карточки."
+    )
+    try:
+        raw = await api_call_with_retry(model_id, [{"role": "user", "content": prompt}], 2000)
+        briefs: list[str] = [""] * n
+        current_idx = -1
+        current_lines: list[str] = []
+        for line in raw.splitlines():
+            m = re.match(r'^\[(\d+)\]', line.strip())
+            if m:
+                if current_idx >= 0 and current_idx < n:
+                    briefs[current_idx] = "\n".join(current_lines).strip()
+                current_idx = int(m.group(1)) - 1
+                current_lines = [line]
+            elif current_idx >= 0:
+                current_lines.append(line)
+        if current_idx >= 0 and current_idx < n:
+            briefs[current_idx] = "\n".join(current_lines).strip()
+        logging.info(f"[{task_id}] 📝 Мини-брифы: {sum(1 for b in briefs if b)}/{n}")
+        return briefs
+    except Exception as e:
+        logging.warning(f"[{task_id}] Мини-брифы не удалось сгенерировать: {e}")
+        return [""] * n
+
+
 # ---------------------------------------------------------------------------
 # СОСТОЯНИЯ
 # ---------------------------------------------------------------------------
@@ -1464,10 +1512,9 @@ async def generate_script(message: types.Message, state: FSMContext):
 
         # ── ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ГЕНЕРАЦИИ ──────────────────────────────
         full_script_parts: list[str] = [""] * n
-        used_facts_tracker = ""  # трекер конкретных фактов — не допускает повторов
 
-        def build_chapter_prompt(index, title, prev_text="", used_facts=""):
-            # Мастер-документ — ВСЕГДА первым
+        def build_chapter_prompt(index, title, prev_text="", narrative_state="", mini_brief=""):
+            # Мастер-документ — якорь истины
             lore_block = (
                 f"╔══════════════════════════════════╗\n"
                 f"║         МАСТЕР-ДОКУМЕНТ          ║\n"
@@ -1478,42 +1525,55 @@ async def generate_script(message: types.Message, state: FSMContext):
                 f"════════════════════════════════════\n\n"
             ) if master_doc else ""
 
-            # Хвост предыдущей части — для бесшовного перехода
+            # Хвост предыдущей части — увеличен до 1500 символов
             prev_block = (
-                f"ТАК ЗАКАНЧИВАЕТСЯ ПРЕДЫДУЩАЯ ЧАСТЬ (продолжи с этой точки):\n"
-                f"«...{prev_text[-800:]}»\n\n"
+                f"ТАК ЗАКАНЧИВАЕТСЯ ПРЕДЫДУЩАЯ ЧАСТЬ — ПРОДОЛЖИ ОТСЮДА:\n"
+                f"«...{prev_text[-1500:]}»\n\n"
             ) if prev_text else ""
 
-            # Конкретные факты которые уже были — не повторять
-            facts_block = (
-                f"УЖЕ ИСПОЛЬЗОВАННЫЕ ФАКТЫ — НЕ ПОВТОРЯТЬ:\n{used_facts}\n\n"
-            ) if used_facts else ""
+            # Нарративный стейт — богатый контекст вместо голых фактов
+            state_block = (
+                f"НАРРАТИВНАЯ ЭСТАФЕТА (что было до тебя):\n{narrative_state}\n\n"
+            ) if narrative_state else ""
 
-            # Зона текущей части — что именно писать
-            current_zone = title  # содержит «Заголовок | что раскрывается»
+            # Мини-бриф — конкретное задание для этой части
+            brief_block = (
+                f"ТВОЁ ЗАДАНИЕ ДЛЯ ЭТОЙ ЧАСТИ:\n{mini_brief}\n\n"
+            ) if mini_brief else ""
+
+            # Подсказка по позиции в структуре
+            if index == 0:
+                position_hint = "Это ПЕРВАЯ часть — начни с сильного зацепляющего момента, без вступлений и приветствий."
+            elif index == n - 1:
+                position_hint = "Это ПОСЛЕДНЯЯ часть — подведи к финальному выводу, дай ощущение завершённости истории."
+            else:
+                position_hint = f"Это часть {index+1} из {n} — продолжай нарратив, не начинай заново."
 
             return (
                 f"{lore_block}"
                 f"ПЛАН ВСЕГО СЦЕНАРИЯ ({n} частей):\n{full_plan_str}\n\n"
                 f"{prev_block}"
-                f"{facts_block}"
-                f"СЕЙЧАС ПИШЕШЬ: часть №{index+1} из {n} — «{current_zone}»\n\n"
+                f"{state_block}"
+                f"{brief_block}"
+                f"СЕЙЧАС ПИШЕШЬ: часть №{index+1} из {n} — «{title}»\n"
+                f"{position_hint}\n\n"
                 f"ГЛАВНОЕ ПРАВИЛО: этот текст — фрагмент единого сплошного повествования. "
-                f"Не начинай с нуля. Не делай вводных предложений типа 'Сегодня мы поговорим'. "
-                f"Продолжай историю там, где она прервалась. "
-                f"В конце не подводи итог — оборви на интересном месте чтобы читатель хотел продолжения.\n\n"
+                f"Не начинай с нуля. Не делай вводных предложений типа «Сегодня мы поговорим», "
+                f"«В этом видео», «Привет». Продолжай историю там, где она прервалась. "
+                f"В конце оборви на крючке из брифа — не подводи итог.\n\n"
                 f"СТИЛЬ: {style_prompt}\n\n"
                 f"ТЕХНИЧЕСКИЕ ТРЕБОВАНИЯ:\n"
                 f"1. Объём: ровно {words_to_request} слов.\n"
                 f"2. Формат: сплошной текст без заголовков, списков, символов #*-.\n"
                 f"3. ЗАПРЕЩЕНО: вступления, подведение итогов, призывы к зрителям, "
-                f"повтор фактов из списка выше."
+                f"повтор фактов из нарративной эстафеты."
             )
 
-        async def generate_one(index, title, prev_text="", used_facts="", is_regen=False):
+        async def generate_one(index, title, prev_text="", narrative_state="",
+                               mini_brief="", is_regen=False):
             if await get_task_status(task_id) == "Cancelled":
                 return
-            prompt = build_chapter_prompt(index, title, prev_text, used_facts)
+            prompt = build_chapter_prompt(index, title, prev_text, narrative_state, mini_brief)
             try:
                 raw   = await api_call_with_retry(
                     model_id, [{"role": "user", "content": prompt}], max_tokens_chapter,
@@ -1525,66 +1585,117 @@ async def generate_script(message: types.Message, state: FSMContext):
                 logging.error(f"[{task_id}] ❌ {index+1}: {e}")
                 full_script_parts[index] = ""
 
-        async def extract_used_facts(texts: list[str]) -> str:
-            """Извлекает конкретные факты/имена/даты из уже написанных частей."""
-            combined = " ".join(t[:2000] for t in texts if t)
-            if not combined.strip():
+        async def extract_narrative_state(text: str, chapter_index: int, chapter_title: str) -> str:
+            """
+            После каждой главы создаёт «нарративную эстафету» для следующего автора:
+            где мы в истории, что открыто, какой тон, что нельзя повторять.
+            """
+            if not text or not text.strip():
                 return ""
+            sample = text[-3000:]
             try:
                 return (await api_call_with_retry(
                     model_id,
                     [{"role": "user", "content":
-                      f"Выпиши КОНКРЕТНЫЕ факты из текста: имена, даты, цифры, названия мест, "
-                      f"ключевые события. Каждый факт — одной строкой. Без пояснений.\n\n{combined}"}],
-                    500,
+                      f"Ты — сценарный редактор. Глава №{chapter_index+1} «{chapter_title}» написана.\n"
+                      f"Составь передачу эстафеты следующему автору.\n\n"
+                      f"ХВОСТ ГЛАВЫ:\n{sample}\n\n"
+                      f"Ответь СТРОГО в этом формате (без лишних слов):\n"
+                      f"ПОСЛЕДНЕЕ СОБЫТИЕ: [одно предложение — чем закончилась эта часть]\n"
+                      f"ОТКРЫТЫЙ КРЮЧОК: [какой вопрос или напряжение оставлено без ответа]\n"
+                      f"ЭМОЦИОНАЛЬНЫЙ ТОН: [одно слово: тревога/надежда/удивление/напряжение/грусть/триумф]\n"
+                      f"АКТИВНЫЕ ЛИЦА: [кто последний раз упоминался]\n"
+                      f"НЕ ПОВТОРЯТЬ: [3-5 конкретных факта или фразы которые уже прозвучали]"}],
+                    350,
                 )).strip()
             except Exception:
                 return ""
 
-        # ── ГЕНЕРАЦИЯ ЧАСТЕЙ ───────────────────────────────────────────────
-        done_count         = 0
-        SEQ_CHAPTERS       = min(6, n)  # первые 6 — последовательно
+        async def stitch_seams(parts: list[str]) -> list[str]:
+            """
+            Для каждой пары соседних частей сглаживает стык:
+            берёт хвост части N и голову части N+1, просит модель переписать
+            их как единый фрагмент без разрыва. Все вызовы параллельны.
+            """
+            if len(parts) <= 1:
+                return parts
 
-        # Первые главы последовательно — prev_text для бесшовного перехода
-        for i in range(SEQ_CHAPTERS):
+            HALF = 250  # слов с каждой стороны стыка
+            result = list(parts)
+
+            async def fix_seam(i: int):
+                words_a = result[i].split()
+                words_b = result[i + 1].split()
+                if len(words_a) < 60 or len(words_b) < 60:
+                    return
+                tail_a = " ".join(words_a[-HALF:])
+                head_b = " ".join(words_b[:HALF])
+                try:
+                    stitched = await api_call_with_retry(
+                        model_id,
+                        [{"role": "user", "content":
+                          f"Два фрагмента одного сценария идут подряд, но переход резкий.\n"
+                          f"Перепиши их как ЕДИНЫЙ плавный отрывок.\n"
+                          f"Сохрани все факты и события. Убери любые «начальные» фразы из второго фрагмента.\n"
+                          f"Объём — примерно такой же. Только текст, без комментариев.\n\n"
+                          f"КОНЕЦ ПЕРВОГО:\n«...{tail_a}»\n\n"
+                          f"НАЧАЛО ВТОРОГО:\n«{head_b}...»"}],
+                        min(HALF * 4, 3000),
+                    )
+                    if not stitched or len(stitched.split()) < HALF * 0.6:
+                        return
+                    stitched_words = stitched.split()
+                    mid = len(stitched_words) // 2
+                    result[i]     = " ".join(words_a[:-HALF] + stitched_words[:mid])
+                    result[i + 1] = " ".join(stitched_words[mid:] + words_b[HALF:])
+                    logging.info(f"[{task_id}] 🔗 Стык {i+1}↔{i+2} сглажен")
+                except Exception as e:
+                    logging.warning(f"[{task_id}] Стык {i+1}: {e}")
+
+            await asyncio.gather(*[fix_seam(i) for i in range(len(result) - 1)])
+            return result
+
+        # ── МИНИ-БРИФЫ ─────────────────────────────────────────────────────
+        await safe_edit(
+            status_msg,
+            f"⏳ <b>Генерация сценария</b>\n\n"
+            f"🆔 ID: <code>{task_id}</code>\n"
+            f"🤖 Модель: <b>{friendly_model}</b>\n\n"
+            f"[░░░░░░░░░░] 0%\n"
+            f"📝 <i>Составляем план для каждой части...</i>",
+            reply_markup=cancel_kb,
+        )
+        mini_briefs = await generate_mini_briefs(
+            model_id, chapters, master_doc, data['topic'], style_prompt, task_id
+        )
+
+        # ── ГЕНЕРАЦИЯ ЧАСТЕЙ: полностью последовательно ────────────────────
+        done_count      = 0
+        narrative_state = ""  # нарративный контекст, обновляется после каждой главы
+
+        for i in range(n):
             if await get_task_status(task_id) == "Cancelled":
                 return
             prev = full_script_parts[i - 1] if i > 0 else ""
-            await generate_one(i, chapters[i], prev_text=prev, used_facts=used_facts_tracker)
+            await generate_one(
+                i, chapters[i],
+                prev_text=prev,
+                narrative_state=narrative_state,
+                mini_brief=mini_briefs[i] if i < len(mini_briefs) else "",
+            )
             done_count += 1
             await safe_edit(
                 status_msg,
                 build_progress_text(task_id, friendly_model, n, done_count,
-                                    max(0, math.ceil((n - done_count) / chunk_size))),
+                                    max(0, n - done_count)),
                 reply_markup=cancel_kb,
             )
-            # Обновляем трекер фактов после каждой главы
-            new_facts = await extract_used_facts([full_script_parts[i]])
-            if new_facts:
-                used_facts_tracker = (used_facts_tracker + "\n" + new_facts)[-2000:]
-
-        # Остальные — параллельно пачками
-        remaining = list(range(SEQ_CHAPTERS, n))
-        for batch_start in range(0, len(remaining), chunk_size):
-            if await get_task_status(task_id) == "Cancelled":
-                return
-            batch = remaining[batch_start:batch_start + chunk_size]
-            await asyncio.gather(*[
-                generate_one(i, chapters[i], used_facts=used_facts_tracker) for i in batch
-            ])
-            done_count += len(batch)
-            await safe_edit(
-                status_msg,
-                build_progress_text(task_id, friendly_model, n, done_count,
-                                    max(0, math.ceil((n - done_count) / chunk_size))),
-                reply_markup=cancel_kb,
+            # Обновляем нарративный стейт — заменяем целиком, не накапливаем
+            new_state = await extract_narrative_state(
+                full_script_parts[i], i, chapters[i]
             )
-            await asyncio.sleep(2)
-            # Обновляем трекер после каждой пачки
-            if batch_start + chunk_size < len(remaining):
-                new_facts = await extract_used_facts([full_script_parts[i] for i in batch])
-                if new_facts:
-                    used_facts_tracker = (used_facts_tracker + "\n" + new_facts)[-2000:]
+            if new_state:
+                narrative_state = new_state
 
         if await get_task_status(task_id) == "Cancelled":
             return
@@ -1605,10 +1716,15 @@ async def generate_script(message: types.Message, state: FSMContext):
                     return
                 if not short_indices:
                     break
-                await asyncio.gather(*[
-                    generate_one(i, chapters[i], used_facts=used_facts_tracker, is_regen=True)
-                    for i in short_indices
-                ])
+                for i in short_indices:
+                    prev = full_script_parts[i - 1] if i > 0 else ""
+                    await generate_one(
+                        i, chapters[i],
+                        prev_text=prev,
+                        narrative_state=narrative_state,
+                        mini_brief=mini_briefs[i] if i < len(mini_briefs) else "",
+                        is_regen=True,
+                    )
                 await asyncio.sleep(2)
                 short_indices = [
                     i for i in short_indices
@@ -1621,6 +1737,19 @@ async def generate_script(message: types.Message, state: FSMContext):
 
         # ── СБОРКА ─────────────────────────────────────────────────────────
         assembled_parts = inject_cta(full_script_parts, cta_positions, style_prompt, data['topic'])
+
+        # Сглаживаем стыки между частями
+        await safe_edit(
+            status_msg,
+            f"⏳ <b>Генерация сценария</b>\n\n"
+            f"🆔 ID: <code>{task_id}</code>\n"
+            f"🤖 Модель: <b>{friendly_model}</b>\n\n"
+            f"[▓▓▓▓▓▓▓▓░░] 80%\n"
+            f"🔗 <i>Сглаживание переходов между частями...</i>",
+            reply_markup=None,
+        )
+        assembled_parts = await stitch_seams(assembled_parts)
+
         full_script = "".join(assembled_parts).strip()
         full_script = re.sub(r'\n{3,}', '\n\n', full_script)
         word_count  = len(full_script.split())
