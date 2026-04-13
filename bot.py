@@ -1126,7 +1126,7 @@ async def process_topic(message: types.Message, state: FSMContext):
         hint = f"\n\n✅ <i>Обнаружена фактура ({len(factual.split())} слов) — будет использована при генерации.</i>"
 
     await message.answer(
-        f"📌 Тема: <b>{_esc(topic)}</b>{hint}\n\nВыбери жанр сценария:",
+        f"📌 Тема: <b>{topic[:100]}</b>{hint}\n\nВыбери жанр сценария:",
         reply_markup=get_style_kb(), parse_mode="HTML",
     )
     await state.set_state(ScriptMaker.waiting_for_style)
