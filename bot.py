@@ -503,42 +503,123 @@ async def upload_to_backup(file_path: str) -> str | None:
         return None
 
 
-async def generate_master_doc(model_id: str, topic: str, style_prompt: str, duration_min: int) -> str:
+async def generate_master_doc(
+    model_id: str, topic: str, style_prompt: str,
+    duration_min: int, script_style: str = "documentary", factual: str = ""
+) -> str:
     """
-    Генерирует мастер-документ (синопсис) ДО написания глав.
-    Жёстко фиксирует имена, факты, хронологию — передаётся в каждую главу.
+    Генерирует мастер-документ ДО написания глав.
+    Промпт зависит от жанра: fiction / documentary / educational.
     """
-    prompt = (
-        f"Ты — главный сценарист. Создай МАСТЕР-ДОКУМЕНТ для YouTube-сценария.\n"
-        f"ТЕМА: «{topic}»\n"
-        f"ЖАНР И СТИЛЬ: {style_prompt[:200]}\n"
-        f"ХРОНОМЕТРАЖ: ~{duration_min} минут\n\n"
-        f"ЗАДАЧА: придумай и жёстко зафикси все детали истории. Пиши КОНКРЕТНО, "
-        f"не используй общие фразы типа «опытный врач» или «молодая женщина».\n\n"
-        f"1. ГЛАВНЫЕ ГЕРОИ (минимум 2-3 персонажа):\n"
-        f"   Для каждого укажи: полные ФИО, точный возраст, профессия, "
-        f"   главная черта характера, тайна или боль персонажа.\n"
-        f"   ВАЖНО: имена должны быть уникальными, не повторяться и не путаться между собой.\n\n"
-        f"2. ПРЕДЫСТОРИЯ КОНФЛИКТА:\n"
-        f"   Что произошло в прошлом? Какая тайна лежит в основе истории? "
-        f"   Кто виноват на самом деле? (Конкретные события, даты, имена.)\n\n"
-        f"3. ХРОНОЛОГИЯ СЮЖЕТА:\n"
-        f"   — Завязка: с чего конкретно начинается история\n"
-        f"   — Поворотный момент: неожиданное событие в середине\n"
-        f"   — Кульминация: самый напряжённый момент\n"
-        f"   — Развязка: чем всё заканчивается, какой вывод\n\n"
-        f"4. СЕТТИНГ: конкретный город, место, год или время года.\n\n"
-        f"5. КЛЮЧЕВЫЕ ФАКТЫ КОТОРЫЕ НЕЛЬЗЯ МЕНЯТЬ:\n"
-        f"   Перечисли 5-7 конкретных деталей (имена родственников, даты событий, "
-        f"   названия мест, цифры), которые должны оставаться неизменными во всём сценарии.\n\n"
-        f"Объём: 350-450 слов. Только структурированные факты, никакого художественного текста.\n"
-        f"Этот документ — ЗАКОН для всего сценария. Факты из него менять ЗАПРЕЩЕНО."
-    )
+    factual_block = (
+        f"\nПОЛЬЗОВАТЕЛЬСКАЯ ФАКТУРА (используй как основу, не придумывай лишнего):\n"
+        f"{factual}\n"
+    ) if factual else ""
+
+    if script_style == "fiction":
+        # ── ХУДОЖЕСТВЕННЫЙ ─────────────────────────────────────────────────
+        prompt = (
+            f"Ты — главный сценарист. Создай МАСТЕР-ДОКУМЕНТ для художественного "
+            f"YouTube-сценария.\n"
+            f"ТЕМА: «{topic}»\n"
+            f"СТИЛЬ: {style_prompt[:200]}\n"
+            f"ХРОНОМЕТРАЖ: ~{duration_min} минут\n"
+            f"{factual_block}\n"
+            f"СОЗДАЙ И ЖЁСТКО ЗАФИКСИ:\n\n"
+            f"1. ПЕРСОНАЖИ (минимум 2-3):\n"
+            f"   Для каждого: полные ФИО (придумай конкретные имена, они не должны "
+            f"   повторяться и не должны путаться между собой), точный возраст, "
+            f"   профессия, главная черта характера, тайна или боль персонажа.\n"
+            f"   СТОП-СЛОВА: нельзя использовать 'молодая женщина', 'опытный врач' — "
+            f"   только конкретные имена и детали.\n\n"
+            f"2. ПРЕДЫСТОРИЯ КОНФЛИКТА:\n"
+            f"   Что произошло в прошлом? Конкретные события, даты, имена. "
+            f"   Кто виноват на самом деле?\n\n"
+            f"3. ХРОНОЛОГИЯ СЮЖЕТА:\n"
+            f"   — Завязка: с чего конкретно начинается история\n"
+            f"   — Поворотный момент: неожиданное событие меняющее всё\n"
+            f"   — Кульминация: самый напряжённый момент\n"
+            f"   — Развязка: чем всё заканчивается\n\n"
+            f"4. СЕТТИНГ: конкретный город, место, год или время года.\n\n"
+            f"5. НЕРУШИМЫЕ ДЕТАЛИ (7-10 фактов):\n"
+            f"   Конкретные детали которые НЕЛЬЗЯ менять во всём сценарии: "
+            f"   имена родственников, возраст, даты событий, названия мест, "
+            f"   профессии, физические особенности персонажей.\n"
+            f"   Пример: «Дочь главного героя зовётся Виолетта, ей 9 лет, "
+            f"   она учится в 3-м классе школы №47 в Екатеринбурге».\n\n"
+            f"Объём: 400-500 слов. Только структурированные факты.\n"
+            f"ЗАКОН: все имена и факты из этого документа ЗАПРЕЩЕНО менять "
+            f"в любой части сценария."
+        )
+
+    elif script_style == "documentary":
+        # ── ДОКУМЕНТАЛЬНЫЙ ─────────────────────────────────────────────────
+        prompt = (
+            f"Ты — главный редактор документального канала. Создай МАСТЕР-ДОКУМЕНТ "
+            f"для документального YouTube-сценария.\n"
+            f"ТЕМА: «{topic}»\n"
+            f"СТИЛЬ: {style_prompt[:200]}\n"
+            f"ХРОНОМЕТРАЖ: ~{duration_min} минут\n"
+            f"{factual_block}\n"
+            f"ВАЖНО: Используй ТОЛЬКО реальные факты. Ничего не придумывай. "
+            f"Если факт неизвестен — так и пиши 'точная дата неизвестна'.\n\n"
+            f"СОСТАВЬ:\n\n"
+            f"1. ГЛАВНЫЕ РЕАЛЬНЫЕ ФИГУРЫ:\n"
+            f"   Реальные люди упоминаемые в теме: ФИО, роль, годы жизни если известны.\n\n"
+            f"2. КЛЮЧЕВЫЕ ФАКТЫ И ДАТЫ:\n"
+            f"   8-12 конкретных фактов с датами которые составляют основу сценария. "
+            f"   Только то что можно проверить.\n\n"
+            f"3. ХРОНОЛОГИЯ СОБЫТИЙ:\n"
+            f"   Временная линия — что за чем происходило.\n\n"
+            f"4. ГЛАВНЫЙ ТЕЗИС:\n"
+            f"   Что должен вынести зритель после просмотра? "
+            f"   Какой главный вывод или открытие?\n\n"
+            f"5. СПОРНЫЕ ИЛИ НЕИЗВЕСТНЫЕ МОМЕНТЫ:\n"
+            f"   Что точно неизвестно? Где есть версии? "
+            f"   (Чтобы сценарий не выдавал домыслы за факты.)\n\n"
+            f"6. НЕЛЬЗЯ ПРИДУМЫВАТЬ:\n"
+            f"   Перечисли конкретные вещи которые модель может захотеть додумать — "
+            f"   и которые нельзя.\n\n"
+            f"Объём: 350-450 слов. Только проверяемые факты.\n"
+            f"ЗАКОН: никакой выдумки, никаких несуществующих цитат, "
+            f"никаких додуманных дат."
+        )
+
+    else:
+        # ── ПОЗНАВАТЕЛЬНЫЙ ─────────────────────────────────────────────────
+        prompt = (
+            f"Ты — главный редактор образовательного канала. Создай МАСТЕР-ДОКУМЕНТ "
+            f"для познавательного YouTube-сценария.\n"
+            f"ТЕМА: «{topic}»\n"
+            f"СТИЛЬ: {style_prompt[:200]}\n"
+            f"ХРОНОМЕТРАЖ: ~{duration_min} минут\n"
+            f"{factual_block}\n"
+            f"СОСТАВЬ:\n\n"
+            f"1. ГЛАВНЫЙ ВОПРОС:\n"
+            f"   На какой главный вопрос отвечает этот сценарий? "
+            f"   Сформулируй одним предложением.\n\n"
+            f"2. КЛЮЧЕВЫЕ ПОНЯТИЯ (5-8):\n"
+            f"   Термины и концепции которые будут объяснены. "
+            f"   Для каждого — одно точное определение.\n\n"
+            f"3. СТРУКТУРА ОБЪЯСНЕНИЯ:\n"
+            f"   — Отправная точка: с чего начинаем (что зритель уже знает)\n"
+            f"   — Ключевые открытия: 3-5 идей которые удивят или просветят\n"
+            f"   — Главный вывод: что зритель поймёт в конце\n\n"
+            f"4. ФАКТЫ И ПРИМЕРЫ:\n"
+            f"   6-10 конкретных примеров, цифр, историй которые будут "
+            f"   использованы для объяснения.\n\n"
+            f"5. НЕЛЬЗЯ УПРОЩАТЬ:\n"
+            f"   Какие нюансы темы нельзя потерять ради доступности?\n\n"
+            f"Объём: 350-450 слов.\n"
+            f"ЗАКОН: все факты и определения из этого документа остаются "
+            f"неизменными во всём сценарии."
+        )
+
     try:
         result = await api_call_with_retry(
             model_id,
             [{"role": "user", "content": prompt}],
-            900,
+            1000,
         )
         return result.strip() if result else ""
     except Exception as e:
@@ -550,6 +631,7 @@ async def generate_master_doc(model_id: str, topic: str, style_prompt: str, dura
 # ---------------------------------------------------------------------------
 class ScriptMaker(StatesGroup):
     waiting_for_topic    = State()
+    waiting_for_style    = State()   # выбор жанра
     waiting_for_duration = State()
     waiting_for_template = State()
 
@@ -581,7 +663,29 @@ def get_models_kb():
         [KeyboardButton(text="🔙 Назад в меню")],
     ], resize_keyboard=True)
 
-def get_templates_menu_kb():
+def get_style_kb():
+    return ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text="🎭 Художественный")],
+        [KeyboardButton(text="📰 Документальный")],
+        [KeyboardButton(text="🎓 Познавательный")],
+        [KeyboardButton(text="🔙 Назад в меню")],
+    ], resize_keyboard=True)
+
+
+def detect_factual_content(topic: str) -> tuple[str, str]:
+    """
+    Если тема длиннее 300 символов — считаем что пользователь вставил
+    фактуру вместе с темой. Разделяем их.
+    Возвращает (чистая_тема, фактура).
+    """
+    topic = topic.strip()
+    if len(topic) <= 300:
+        return topic, ""
+    # Берём первую строку как тему, остальное — фактура
+    lines = topic.splitlines()
+    clean_topic = lines[0].strip()
+    factual     = "\n".join(lines[1:]).strip()
+    return clean_topic, factual
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="➕ Добавить шаблон"), KeyboardButton(text="✏️ Изменить шаблон")],
         [KeyboardButton(text="🗑 Удалить шаблон"),  KeyboardButton(text="🔙 Назад в меню")],
@@ -998,14 +1102,51 @@ async def cancel_task_handler(call: types.CallbackQuery):
 
 @dp.message(F.text == "🎬 Создать сценарий")
 async def start_script(message: types.Message, state: FSMContext):
-    await message.answer("О чём видео?", reply_markup=types.ReplyKeyboardRemove())
+    await message.answer(
+        "О чём видео?\n\n"
+        "<i>Можешь вставить просто тему или тему + фактуру (цитаты, даты, факты) — "
+        "бот разберётся сам.</i>",
+        reply_markup=types.ReplyKeyboardRemove(), parse_mode="HTML",
+    )
     await state.set_state(ScriptMaker.waiting_for_topic)
 
 
 @dp.message(ScriptMaker.waiting_for_topic)
 async def process_topic(message: types.Message, state: FSMContext):
-    await state.update_data(topic=message.text)
-    await message.answer("Длительность (мин):")
+    text = message.text.strip()
+    if len(text) > 4096:
+        await message.answer("⚠️ Слишком длинный текст. Сократи до 4096 символов.")
+        return
+
+    topic, factual = detect_factual_content(text)
+    await state.update_data(topic=topic, factual=factual)
+
+    hint = ""
+    if factual:
+        hint = f"\n\n✅ <i>Обнаружена фактура ({len(factual.split())} слов) — будет использована при генерации.</i>"
+
+    await message.answer(
+        f"📌 Тема: <b>{_esc(topic)}</b>{hint}\n\nВыбери жанр сценария:",
+        reply_markup=get_style_kb(), parse_mode="HTML",
+    )
+    await state.set_state(ScriptMaker.waiting_for_style)
+
+
+STYLE_MAP = {
+    "🎭 Художественный": "fiction",
+    "📰 Документальный": "documentary",
+    "🎓 Познавательный": "educational",
+}
+
+@dp.message(ScriptMaker.waiting_for_style)
+async def process_style(message: types.Message, state: FSMContext):
+    if message.text == "🔙 Назад в меню":
+        return await back_to_main(message, state)
+    if message.text not in STYLE_MAP:
+        await message.answer("Выбери жанр из списка:", reply_markup=get_style_kb())
+        return
+    await state.update_data(script_style=STYLE_MAP[message.text])
+    await message.answer("Длительность (мин):", reply_markup=types.ReplyKeyboardRemove())
     await state.set_state(ScriptMaker.waiting_for_duration)
 
 
@@ -1111,11 +1252,16 @@ async def generate_script(message: types.Message, state: FSMContext):
         # ── МАСТЕР-ДОКУМЕНТ (синопсис) — генерируется ДО плана ─────────────
         target_chapters = max(1, round(words_target / WORDS_PER_CHAPTER))
         master_doc      = ""
-        # Синопсис нужен только для длинных сценариев (>3 глав) или нарративных жанров
+        script_style    = data.get("script_style", "documentary")
+        factual         = data.get("factual", "")
+
         if target_chapters > 3:
-            master_doc = await generate_master_doc(model_id, data['topic'], style_prompt, duration)
+            master_doc = await generate_master_doc(
+                model_id, data['topic'], style_prompt, duration,
+                script_style=script_style, factual=factual,
+            )
             if master_doc:
-                logging.info(f"[{task_id}] 📋 Мастер-документ: {len(master_doc.split())} слов")
+                logging.info(f"[{task_id}] 📋 Мастер-документ ({script_style}): {len(master_doc.split())} слов")
 
         # ── ПЛАН ───────────────────────────────────────────────────────────
         master_block = f"\nОПИРАЙСЯ СТРОГО НА ЭТОТ СИНОПСИС:\n{master_doc}\n\n" if master_doc else ""
@@ -1154,7 +1300,8 @@ async def generate_script(message: types.Message, state: FSMContext):
         words_to_request   = max(50, int(words_per_chapter * overrequest_factor))
         max_tokens_chapter = min(int(words_to_request * 2.4), 2048)
         # CTA только если пользователь явно упомянул это в шаблоне
-        _cta_keywords = ("cta", "комментар", "призыв", "подписк", "лайк", "вопрос к зрител")
+        _cta_keywords = ("cta", "комментар", "призыв", "подписк", "лайк",
+                         "вопрос к зрител", "байт", "одно слово", "комментари")
         _user_wants_cta = any(kw in style_prompt.lower() for kw in _cta_keywords)
         cta_positions  = compute_cta_positions(n) if _user_wants_cta else set()
         full_plan_str      = "\n".join(f"{i+1}. {t}" for i, t in enumerate(chapters))
@@ -1240,22 +1387,22 @@ async def generate_script(message: types.Message, state: FSMContext):
                 full_script_parts[index] = ""
 
         async def get_covered_summary(texts):
-            combined = " ".join(t[:600] for t in texts if t)
+            combined = " ".join(t[:1500] for t in texts if t)
             if not combined.strip():
                 return ""
             try:
                 return (await api_call_with_retry(
                     model_id,
                     [{"role": "user", "content":
-                      f"Перечисли в 3-4 предложениях ключевые тезисы. Только суть:\n\n{combined}"}],
-                    300,
+                      f"Перечисли в 5-6 предложениях ключевые тезисы и факты. Только суть:\n\n{combined}"}],
+                    600,
                 )).strip()
             except Exception:
                 return ""
 
         # ── ГЕНЕРАЦИЯ ЧАСТЕЙ ───────────────────────────────────────────────
         done_count     = 0
-        SEQ_CHAPTERS   = min(3, n)  # первые 3 — последовательно для prev_text
+        SEQ_CHAPTERS   = min(6, n)  # первые 6 — последовательно для prev_text и связности
 
         # Первые главы последовательно — передаём prev_text для плавной стыковки
         for i in range(SEQ_CHAPTERS):
