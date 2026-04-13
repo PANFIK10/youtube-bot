@@ -1153,7 +1153,10 @@ async def generate_script(message: types.Message, state: FSMContext):
         overrequest_factor = VOLUME_OVERREQUEST_FACTORS.get(model_id, VOLUME_OVERREQUEST_FACTOR_DEFAULT)
         words_to_request   = max(50, int(words_per_chapter * overrequest_factor))
         max_tokens_chapter = min(int(words_to_request * 2.4), 2048)
-        cta_positions      = compute_cta_positions(n)
+        # CTA только если пользователь явно упомянул это в шаблоне
+        _cta_keywords = ("cta", "комментар", "призыв", "подписк", "лайк", "вопрос к зрител")
+        _user_wants_cta = any(kw in style_prompt.lower() for kw in _cta_keywords)
+        cta_positions  = compute_cta_positions(n) if _user_wants_cta else set()
         full_plan_str      = "\n".join(f"{i+1}. {t}" for i, t in enumerate(chapters))
         chunk_size         = 5
         total_chunks       = math.ceil(n / chunk_size)
@@ -1177,8 +1180,10 @@ async def generate_script(message: types.Message, state: FSMContext):
 
         def build_chapter_prompt(index, title, prev_text="", covered="", include_cta=False):
             cta_instr = (
-                "\nCTA: В самом конце этой части — один ненавязчивый вопрос к зрителям."
-                if include_cta else ""
+                "\nCTA: В самом конце этой части — один короткий вопрос к зрителям (одно предложение)."
+                if include_cta else
+                "\nВАЖНО: В этой части НЕТ призывов к действию, НЕТ вопросов к зрителям, "
+                "НЕТ просьб написать комментарий. Заканчивай мысль — и всё."
             )
             # Мастер-документ — ВСЕГДА первым, с жёсткими разделителями
             lore_block = (
