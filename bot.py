@@ -7,12 +7,12 @@ import asyncpg
 import random
 import string
 from datetime import datetime
-from aiogram import Bot, Dispatcher, types, F
+from aiogram import Bot, Dispatcher, types, F, BaseMiddleware
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
-    ReplyKeyboardMarkup, KeyboardButton, FSInputFile,
+    FSInputFile,
     InlineKeyboardMarkup, InlineKeyboardButton
 )
 from aiogram.exceptions import TelegramBadRequest
@@ -52,6 +52,7 @@ def _next_client() -> AsyncOpenAI:
 MAX_CONCURRENT_TASKS = 25
 _generation_semaphore: asyncio.Semaphore | None = None
 _active_tasks: int = 0
+_generating_users: set[int] = set()   # пользователи у которых прямо сейчас идёт генерация
 
 API_RETRY_ATTEMPTS   = 3
 API_RETRY_BASE_DELAY = 2.0
@@ -62,6 +63,22 @@ logging.basicConfig(level=logging.INFO)
 
 db_pool: asyncpg.Pool | None = None
 
+
+class GenerationGuardMiddleware(BaseMiddleware):
+    """Блокирует любые сообщения от пользователя во время генерации (кроме /start)."""
+    async def __call__(self, handler, event, data):
+        if isinstance(event, types.Message):
+            user_id = event.from_user.id
+            text    = event.text or ""
+            if user_id in _generating_users and not text.startswith("/start"):
+                await event.answer(
+                    "⏳ <b>Идёт генерация</b> — бот временно не принимает команды.\n"
+                    "Дождись результата или нажми <b>❌ Отменить</b> в сообщении с прогрессом.",
+                    parse_mode="HTML",
+                )
+                return
+        return await handler(event, data)
+
 @dp.startup()
 async def on_startup():
     global _generation_semaphore, _key_lock, db_pool, _active_tasks
@@ -70,6 +87,7 @@ async def on_startup():
     _active_tasks = 0
     db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10, ssl="prefer")
     await init_db()
+    dp.message.middleware(GenerationGuardMiddleware())
     logging.info(f"Готов | API ключей: {len(API_KEYS)} | Очередь: {MAX_CONCURRENT_TASKS}")
 
 @dp.shutdown()
@@ -505,7 +523,7 @@ def inject_cta(parts: list[str], cta_positions: set[int],
         if idx >= len(result) or not result[idx]:
             continue
         # Простой CTA — одно предложение в конце главы
-        cta_text = f"\n\nНапиши в комментарии одно слово — что ты думаешь об этом?"
+        cta_text = "\n\nНапиши в комментарии одно слово — что ты думаешь об этом?"
         result[idx] = result[idx].rstrip() + cta_text + "\n\n"
     return result
 
@@ -857,46 +875,121 @@ async def generate_mini_briefs(
 # СОСТОЯНИЯ
 # ---------------------------------------------------------------------------
 class ScriptMaker(StatesGroup):
-    waiting_for_topic    = State()
-    waiting_for_style    = State()   # выбор жанра
-    waiting_for_duration = State()
-    waiting_for_template = State()
+    waiting_for_topic            = State()
+    waiting_for_style            = State()
+    waiting_for_duration         = State()   # ручной ввод (кнопка «Другое»)
+    waiting_for_template         = State()
+
+class BulkMaker(StatesGroup):
+    waiting_for_topics    = State()
+    waiting_for_style     = State()
+    waiting_for_duration  = State()
+    waiting_for_template  = State()
 
 class TemplateManager(StatesGroup):
     waiting_for_new_name    = State()
     waiting_for_new_prompt  = State()
     waiting_for_delete_name = State()
-    waiting_for_edit_name   = State()   # отдельное состояние для редактирования
+    waiting_for_edit_name   = State()
 
 # ---------------------------------------------------------------------------
-# КЛАВИАТУРЫ
+# КЛАВИАТУРЫ (все inline)
 # ---------------------------------------------------------------------------
-def get_main_kb():
-    return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="🎬 Создать сценарий")],
-        [KeyboardButton(text="🗂 Массовая генерация")],
-        [KeyboardButton(text="💰 Баланс"),   KeyboardButton(text="💳 Пополнить")],
-        [KeyboardButton(text="📋 Тарифы"),   KeyboardButton(text="📦 Пакеты")],
-        [KeyboardButton(text="📁 Шаблоны"),  KeyboardButton(text="⚙️ Настройки")],
-        [KeyboardButton(text="👥 Реферальная программа")],
-        [KeyboardButton(text="❓ FAQ"),       KeyboardButton(text="🏠 Главная")],
-    ], resize_keyboard=True)
+def get_main_inline_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎬 Создать сценарий",      callback_data="m_create"),
+         InlineKeyboardButton(text="🗂 Массовая генерация",    callback_data="m_bulk")],
+        [InlineKeyboardButton(text="💰 Баланс",                callback_data="m_balance"),
+         InlineKeyboardButton(text="💳 Пополнить",             callback_data="m_topup")],
+        [InlineKeyboardButton(text="📋 Тарифы",                callback_data="m_tariffs"),
+         InlineKeyboardButton(text="📦 Пакеты",                callback_data="m_packages")],
+        [InlineKeyboardButton(text="📁 Шаблоны",               callback_data="m_templates"),
+         InlineKeyboardButton(text="⚙️ Настройки",             callback_data="m_settings")],
+        [InlineKeyboardButton(text="👥 Реферальная программа", callback_data="m_referral")],
+        [InlineKeyboardButton(text="❓ FAQ",                   callback_data="m_faq")],
+    ])
 
-def get_models_kb():
-    return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="Gemini"),         KeyboardButton(text="Grok")],
-        [KeyboardButton(text="Claude Haiku"),   KeyboardButton(text="ChatGPT")],
-        [KeyboardButton(text="Claude Sonnet ✨")],
-        [KeyboardButton(text="🔙 Назад в меню")],
-    ], resize_keyboard=True)
+def get_style_inline_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎭 Художественный", callback_data="style_fiction")],
+        [InlineKeyboardButton(text="📰 Документальный", callback_data="style_documentary")],
+        [InlineKeyboardButton(text="🎓 Познавательный", callback_data="style_educational")],
+        [InlineKeyboardButton(text="🔙 В меню",         callback_data="m_menu")],
+    ])
 
-def get_style_kb():
-    return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="🎭 Художественный")],
-        [KeyboardButton(text="📰 Документальный")],
-        [KeyboardButton(text="🎓 Познавательный")],
-        [KeyboardButton(text="🔙 Назад в меню")],
-    ], resize_keyboard=True)
+def get_duration_inline_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="15 мин", callback_data="dur_15"),
+         InlineKeyboardButton(text="30 мин", callback_data="dur_30"),
+         InlineKeyboardButton(text="45 мин", callback_data="dur_45")],
+        [InlineKeyboardButton(text="60 мин", callback_data="dur_60"),
+         InlineKeyboardButton(text="90 мин", callback_data="dur_90"),
+         InlineKeyboardButton(text="120 мин", callback_data="dur_120")],
+        [InlineKeyboardButton(text="✏️ Другое число", callback_data="dur_custom")],
+        [InlineKeyboardButton(text="🔙 Назад",        callback_data="dur_back")],
+    ])
+
+def get_models_inline_kb(current_model_id: str = "") -> InlineKeyboardMarkup:
+    model_list = [
+        ("google/gemini-2.5-flash-lite", "🟢 Gemini",        "0.15₽/мин"),
+        ("x-ai/grok-4.1-fast",           "🔵 Grok",          "0.25₽/мин"),
+        ("anthropic/claude-haiku-4.5",   "🟡 Claude Haiku",  "0.75₽/мин"),
+        ("openai/gpt-5.1",               "🟠 ChatGPT",       "1.25₽/мин"),
+        ("anthropic/claude-sonnet-4.6",  "🔴 Claude Sonnet ✨", "2.00₽/мин"),
+    ]
+    rows = []
+    for i, (mid, name, price) in enumerate(model_list):
+        mark = " ✓" if mid == current_model_id else ""
+        rows.append([InlineKeyboardButton(
+            text=f"{name}{mark} — {price}",
+            callback_data=f"model_{i}",
+        )])
+    rows.append([InlineKeyboardButton(text="🔙 В меню", callback_data="m_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def get_templates_menu_inline_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить шаблон",  callback_data="tmgr_add"),
+         InlineKeyboardButton(text="✏️ Изменить шаблон", callback_data="tmgr_edit")],
+        [InlineKeyboardButton(text="🗑 Удалить шаблон",  callback_data="tmgr_del")],
+        [InlineKeyboardButton(text="🔙 В меню",          callback_data="m_menu")],
+    ])
+
+async def get_templates_inline_kb(for_generation: bool = False,
+                                  action_prefix: str = "tpl") -> InlineKeyboardMarkup:
+    """Динамическая клавиатура шаблонов. action_prefix: 'tpl' для генерации, 'tedit'/'tdel' для управления."""
+    templates = await get_templates()
+    rows = []
+    for i, name in enumerate(templates):
+        short = name if len(name) <= 28 else name[:25] + "…"
+        rows.append([InlineKeyboardButton(text=short, callback_data=f"{action_prefix}_{i}")])
+    if for_generation:
+        rows.append([InlineKeyboardButton(text="➕ Создать новый шаблон", callback_data="tpl_new")])
+    rows.append([InlineKeyboardButton(text="🔙 В меню", callback_data="m_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def get_after_gen_inline_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎬 Создать ещё",  callback_data="m_create"),
+         InlineKeyboardButton(text="🏠 В меню",       callback_data="m_menu")],
+    ])
+
+
+# ---------------------------------------------------------------------------
+# ВСПОМОГАТЕЛЬНАЯ: показать главное меню
+# ---------------------------------------------------------------------------
+async def show_menu(target, text: str = "🏠 <b>Главное меню</b>"):
+    """Отправляет или редактирует сообщение с главным меню (inline).
+    target: types.Message или types.CallbackQuery."""
+    kb = get_main_inline_kb()
+    if isinstance(target, types.CallbackQuery):
+        try:
+            await target.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+        except TelegramBadRequest:
+            await target.message.answer(text, reply_markup=kb, parse_mode="HTML")
+        await target.answer()
+    else:
+        await target.answer(text, reply_markup=kb, parse_mode="HTML")
 
 
 def detect_factual_content(topic: str) -> tuple[str, str]:
@@ -916,18 +1009,11 @@ def detect_factual_content(topic: str) -> tuple[str, str]:
 
 
 def get_templates_menu_kb():
-    return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="➕ Добавить шаблон"), KeyboardButton(text="✏️ Изменить шаблон")],
-        [KeyboardButton(text="🗑 Удалить шаблон"),  KeyboardButton(text="🔙 Назад в меню")],
-    ], resize_keyboard=True)
+    # Оставлен для совместимости, возвращает inline-версию
+    return get_templates_menu_inline_kb()
 
 async def get_dynamic_templates_kb(for_generation: bool = False):
-    templates = await get_templates()
-    kb = [[KeyboardButton(text=name)] for name in templates]
-    if not for_generation:
-        kb.append([KeyboardButton(text="➕ Создать новый шаблон")])
-    kb.append([KeyboardButton(text="🔙 Назад в меню")])
-    return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+    return await get_templates_inline_kb(for_generation=for_generation)
 
 # ---------------------------------------------------------------------------
 # ТЕКСТЫ
@@ -1083,27 +1169,21 @@ async def start_cmd(message: types.Message, state: FSMContext):
     username = message.from_user.username
     args     = message.text.split()
 
-    # Проверяем существовал ли пользователь ДО вызова get_or_create_user
     async with db_pool.acquire() as conn:
         existing = await conn.fetchrow("SELECT user_id, credits, first_topup FROM settings WHERE user_id=$1", user_id)
     is_new = existing is None
-
-    user = await get_or_create_user(user_id)
+    user   = await get_or_create_user(user_id)
 
     if username:
         async with db_pool.acquire() as conn:
             await conn.execute("UPDATE settings SET username=$1 WHERE user_id=$2", username.lower(), user_id)
 
-    # /start oferta
     if len(args) > 1:
         if args[1].lower() == "oferta":
-            await message.answer(
-                "📜 <b>Публичная оферта Script AI</b>\n\n"
-                "Самозанятый: Панферов Кирилл Алексеевич\n"
-                "ИНН: 616810872170\n"
-                "📩 kkpanferovvai@gmail.com | 💬 @aass11463",
-                parse_mode="HTML",
-            )
+            await message.answer("📜 <b>Публичная оферта Script AI</b>\n\n"
+                                 "Самозанятый: Панферов Кирилл Алексеевич\n"
+                                 "ИНН: 616810872170\n"
+                                 "📩 kkpanferovvai@gmail.com | 💬 @aass11463", parse_mode="HTML")
             try:
                 await message.answer_document(FSInputFile("oferta_scriptai.docx"), caption="Полный текст договора-оферты")
             except Exception:
@@ -1111,91 +1191,619 @@ async def start_cmd(message: types.Message, state: FSMContext):
             return
         applied = await apply_referral(user_id, args[1])
         if applied:
-            await message.answer(
-                "✅ Реферальная ссылка применена!\n"
-                f"Вы получите бонус +{REFERRAL_BONUS_INVITEE_PCT}% к первому пополнению.",
-                parse_mode="HTML",
-            )
+            await message.answer(f"✅ Реферальная ссылка применена!\nВы получите бонус +{REFERRAL_BONUS_INVITEE_PCT}% к первому пополнению.", parse_mode="HTML")
 
     balance = float(user["credits"] or 0)
-
     if is_new:
-        welcome = (
+        text = (
             "👋 <b>Добро пожаловать в Авто Сценарист!</b>\n\n"
-            "Генерируй готовые YouTube-сценарии за минуты — "
-            "без копирайтеров, без ограничений по длине, без склеек.\n\n"
+            "Генерируй готовые YouTube-сценарии за минуты — без копирайтеров, без ограничений по длине.\n\n"
             "✨ <b>Почему выбирают нас:</b>\n"
-            "⚡ Сценарий на 60 минут — за 3-5 минут\n"
+            "⚡ Сценарий на 60 минут — за 3–5 минут\n"
             "🗂 Массовая генерация — до 5 сценариев за раз\n"
             "🤖 5 топовых моделей — GPT, Claude, Gemini, Grok\n"
             "💰 От 9₽ за полный 60-минутный сценарий\n\n"
-            f"🎁 Тебе начислено <b>{WELCOME_CREDITS} стартовых кредитов</b>!\n\n"
-            f"💰 Ваш баланс: <b>{balance:.1f} кредитов</b>"
+            f"🎁 Тебе начислено <b>{WELCOME_CREDITS} стартовых кредитов</b>!\n"
+            f"💰 Баланс: <b>{balance:.1f} кредитов</b>"
         )
     else:
-        welcome = (
-            "👋 <b>С возвращением!</b>\n\n"
-            "Готов создавать новые сценарии — жми кнопку и поехали 🚀\n\n"
+        text = (
+            f"👋 <b>С возвращением!</b>\n\n"
             f"💰 Баланс: <b>{balance:.1f} кредитов</b>"
         )
 
-    await message.answer(welcome, reply_markup=get_main_kb(), parse_mode="HTML")
+    # Убираем reply-клавиатуру (если была) и отправляем inline-меню
+    await message.answer(text, reply_markup=types.ReplyKeyboardRemove(), parse_mode="HTML")
+    await message.answer("🏠 <b>Главное меню</b>", reply_markup=get_main_inline_kb(), parse_mode="HTML")
 
 
-@dp.message(F.text == "🔄 Перезапустить")
-async def restart_cmd(message: types.Message, state: FSMContext):
+async def back_to_main(message_or_call, state: FSMContext = None):
+    """Универсальная функция возврата в меню."""
+    if state:
+        await state.clear()
+    await show_menu(message_or_call)
+
+
+# ---------------------------------------------------------------------------
+# CALLBACK-ХЕНДЛЕРЫ ГЛАВНОГО МЕНЮ
+# ---------------------------------------------------------------------------
+
+@dp.callback_query(F.data == "m_menu")
+async def cb_menu(call: types.CallbackQuery, state: FSMContext):
     await state.clear()
-    balance = await get_balance(message.from_user.id)
-    await message.answer(
-        WELCOME_TEXT + f"\n\n💰 Ваш баланс: <b>{balance:.1f} кредитов</b>",
-        reply_markup=get_main_kb(), parse_mode="HTML",
-    )
+    balance = await get_balance(call.from_user.id)
+    await show_menu(call, f"🏠 <b>Главное меню</b>\n💰 Баланс: <b>{balance:.1f} кред.</b>")
 
+
+@dp.callback_query(F.data == "m_balance")
+async def cb_balance(call: types.CallbackQuery):
+    user_id = call.from_user.id
+    balance = await get_balance(user_id)
+    txs     = await get_transactions(user_id, limit=7)
+    user    = await get_or_create_user(user_id)
+    text = f"💰 <b>Баланс: {balance:.1f} кредитов</b>\n\n📋 <b>Последние операции:</b>\n"
+    for tx in txs:
+        sign = "+" if tx["amount"] > 0 else ""
+        text += f"  {sign}{tx['amount']:.1f} — {tx['description']} <i>({tx['created_at']})</i>\n"
+    if not txs:
+        text += "  <i>Операций нет</i>\n"
+    text += f"\n🔗 Реферальный код: <code>{user['referral_code']}</code>"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 В меню", callback_data="m_menu")]
+    ])
+    try:
+        await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except TelegramBadRequest:
+        await call.message.answer(text, reply_markup=kb, parse_mode="HTML")
+    await call.answer()
+
+
+@dp.callback_query(F.data == "m_topup")
+async def cb_topup(call: types.CallbackQuery):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        *[[InlineKeyboardButton(
+            text=f"{name} — {price}₽  →  {base+bonus} кред.",
+            callback_data=f"pkg_{i}",
+        )] for i, (price, base, bonus, name) in enumerate(CREDIT_PACKAGES)],
+        [InlineKeyboardButton(text="🔙 В меню", callback_data="m_menu")],
+    ])
+    try:
+        await call.message.edit_text(
+            "💳 <b>Выберите пакет пополнения:</b>\n\n"
+            "<i>Платёжная система подключается — скоро будет автоплатёж.\n"
+            "Пока свяжитесь с поддержкой для ручного пополнения.</i>",
+            reply_markup=kb, parse_mode="HTML",
+        )
+    except TelegramBadRequest:
+        await call.message.answer(
+            "💳 <b>Выберите пакет пополнения:</b>",
+            reply_markup=kb, parse_mode="HTML",
+        )
+    await call.answer()
+
+
+@dp.callback_query(F.data == "m_tariffs")
+async def cb_tariffs(call: types.CallbackQuery):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 В меню", callback_data="m_menu")]
+    ])
+    try:
+        await call.message.edit_text(TARIFFS_TEXT, reply_markup=kb, parse_mode="HTML")
+    except TelegramBadRequest:
+        await call.message.answer(TARIFFS_TEXT, reply_markup=kb, parse_mode="HTML")
+    await call.answer()
+
+
+@dp.callback_query(F.data == "m_packages")
+async def cb_packages(call: types.CallbackQuery):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💳 Пополнить", callback_data="m_topup"),
+         InlineKeyboardButton(text="🔙 В меню",    callback_data="m_menu")],
+    ])
+    try:
+        await call.message.edit_text(build_packages_text(), reply_markup=kb, parse_mode="HTML")
+    except TelegramBadRequest:
+        await call.message.answer(build_packages_text(), reply_markup=kb, parse_mode="HTML")
+    await call.answer()
+
+
+@dp.callback_query(F.data == "m_faq")
+async def cb_faq(call: types.CallbackQuery):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 В меню", callback_data="m_menu")]
+    ])
+    try:
+        await call.message.edit_text(FAQ_TEXT, reply_markup=kb, parse_mode="HTML")
+    except TelegramBadRequest:
+        await call.message.answer(FAQ_TEXT, reply_markup=kb, parse_mode="HTML")
+    await call.answer()
+
+
+@dp.callback_query(F.data == "m_referral")
+async def cb_referral(call: types.CallbackQuery):
+    user     = await get_or_create_user(call.from_user.id)
+    bot_info = await bot.get_me()
+    ref_code = user["referral_code"]
+    ref_link = f"https://t.me/{bot_info.username}?start={ref_code}"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="📤 Поделиться ссылкой",
+            url=f"https://t.me/share/url?url={ref_link}&text=Попробуй%20этот%20бот%20для%20генерации%20YouTube-сценариев!",
+        )],
+        [InlineKeyboardButton(text="🔙 В меню", callback_data="m_menu")],
+    ])
+    text = (
+        "👥 <b>Реферальная программа</b>\n\n"
+        f"🔗 Ваша ссылка:\n<code>{ref_link}</code>\n\n"
+        f"• Вы получаете <b>{REFERRAL_BONUS_INVITER} кредитов</b> когда приглашённый делает первое пополнение\n"
+        f"• Приглашённый получает <b>+{REFERRAL_BONUS_INVITEE_PCT}%</b> бонусных кредитов к первому пополнению\n\n"
+        "<i>Бонус начисляется автоматически.</i>"
+    )
+    try:
+        await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except TelegramBadRequest:
+        await call.message.answer(text, reply_markup=kb, parse_mode="HTML")
+    await call.answer()
+
+
+@dp.callback_query(F.data == "m_settings")
+async def cb_settings(call: types.CallbackQuery):
+    cur      = await get_user_model(call.from_user.id)
+    kb       = get_models_inline_kb(current_model_id=cur)
+    friendly = MODEL_NAMES.get(cur, cur)
+    text     = f"⚙️ <b>Настройки</b>\n\nТекущая модель: <b>{friendly}</b>\n\nВыбери модель:"
+    try:
+        await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except TelegramBadRequest:
+        await call.message.answer(text, reply_markup=kb, parse_mode="HTML")
+    await call.answer()
+
+
+MODEL_LIST_IDS = [
+    "google/gemini-2.5-flash-lite",
+    "x-ai/grok-4.1-fast",
+    "anthropic/claude-haiku-4.5",
+    "openai/gpt-5.1",
+    "anthropic/claude-sonnet-4.6",
+]
+
+
+@dp.callback_query(F.data.startswith("model_"))
+async def cb_change_model(call: types.CallbackQuery):
+    idx = int(call.data.split("_")[1])
+    if idx >= len(MODEL_LIST_IDS):
+        await call.answer("Неизвестная модель")
+        return
+    model_id = MODEL_LIST_IDS[idx]
+    await set_user_model(call.from_user.id, model_id)
+    friendly = MODEL_NAMES.get(model_id, model_id)
+    kb = get_models_inline_kb(current_model_id=model_id)
+    await call.message.edit_text(
+        f"⚙️ <b>Настройки</b>\n\nМодель изменена на: <b>{friendly}</b> ✓",
+        reply_markup=kb, parse_mode="HTML",
+    )
+    await call.answer(f"✅ {friendly}")
+
+
+@dp.callback_query(F.data == "m_templates")
+async def cb_templates_menu(call: types.CallbackQuery):
+    templates = await get_templates()
+    text = "📂 <b>Твои шаблоны:</b>\n\n"
+    if not templates:
+        text += "<i>Пусто — создай первый шаблон.</i>"
+    else:
+        for name, prompt in templates.items():
+            text += f"🔹 <b>{name}</b>\n<i>{prompt[:60]}…</i>\n\n"
+    try:
+        await call.message.edit_text(text, reply_markup=get_templates_menu_inline_kb(), parse_mode="HTML")
+    except TelegramBadRequest:
+        await call.message.answer(text, reply_markup=get_templates_menu_inline_kb(), parse_mode="HTML")
+    await call.answer()
+
+
+@dp.callback_query(F.data == "tmgr_add")
+async def cb_tmgr_add(call: types.CallbackQuery, state: FSMContext):
+    await call.message.answer("Введи название нового шаблона:")
+    await state.set_state(TemplateManager.waiting_for_new_name)
+    await call.answer()
+
+
+@dp.callback_query(F.data == "tmgr_edit")
+async def cb_tmgr_edit(call: types.CallbackQuery, state: FSMContext):
+    kb = await get_templates_inline_kb(action_prefix="tedit")
+    await call.message.edit_text("Какой шаблон изменить?", reply_markup=kb)
+    await state.set_state(TemplateManager.waiting_for_edit_name)
+    await call.answer()
+
+
+@dp.callback_query(F.data == "tmgr_del")
+async def cb_tmgr_del(call: types.CallbackQuery, state: FSMContext):
+    kb = await get_templates_inline_kb(action_prefix="tdel")
+    await call.message.edit_text("Какой шаблон удалить?", reply_markup=kb)
+    await state.set_state(TemplateManager.waiting_for_delete_name)
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("tedit_"))
+async def cb_tedit_pick(call: types.CallbackQuery, state: FSMContext):
+    idx       = int(call.data.split("_")[1])
+    templates = await get_templates()
+    names     = list(templates.keys())
+    if idx >= len(names):
+        await call.answer("Шаблон не найден")
+        return
+    name   = names[idx]
+    prompt = templates[name]
+    await state.update_data(template_name=name)
+    await call.message.answer(
+        f"✏️ Шаблон: <b>{name}</b>\n\n"
+        f"📄 Текущий промпт:\n<blockquote>{prompt}</blockquote>\n\n"
+        "Отправь новый текст промпта:",
+        parse_mode="HTML",
+    )
+    await state.set_state(TemplateManager.waiting_for_new_prompt)
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("tdel_"))
+async def cb_tdel_pick(call: types.CallbackQuery, state: FSMContext):
+    idx       = int(call.data.split("_")[1])
+    templates = await get_templates()
+    names     = list(templates.keys())
+    if idx >= len(names):
+        await call.answer("Шаблон не найден")
+        return
+    name = names[idx]
+    await delete_template(name)
+    await state.clear()
+    await call.answer(f"🗑 Удалён: {name}")
+    await cb_templates_menu(call)
+
+
+# ---------------------------------------------------------------------------
+# НАВИГАЦИЯ (текстовые команды — для совместимости)
+# ---------------------------------------------------------------------------
 
 @dp.message(F.text == "🔙 Назад в меню")
-async def back_to_main(message: types.Message, state: FSMContext):
+async def back_to_main_msg(message: types.Message, state: FSMContext):
     await state.clear()
-    await message.answer("Главное меню:", reply_markup=get_main_kb())
+    await show_menu(message)
 
 
-@dp.message(F.text == "🏠 Главная")
-async def home_cmd(message: types.Message, state: FSMContext):
+# ---------------------------------------------------------------------------
+# СОЗДАНИЕ СЦЕНАРИЯ — ВВОД ТЕМЫ
+# ---------------------------------------------------------------------------
+
+@dp.callback_query(F.data == "m_create")
+async def cb_create(call: types.CallbackQuery, state: FSMContext):
     await state.clear()
-    balance = await get_balance(message.from_user.id)
-    await message.answer(
-        f"🏠 <b>Главное меню</b>\n\n💰 Баланс: <b>{balance:.1f} кредитов</b>",
-        reply_markup=get_main_kb(), parse_mode="HTML",
+    await call.message.answer(
+        "🎬 <b>Новый сценарий</b>\n\n"
+        "О чём видео? Напиши тему.\n\n"
+        "<i>Можно вставить тему + фактуру (цитаты, даты, факты) — бот разберётся сам.</i>",
+        parse_mode="HTML",
     )
+    await state.set_state(ScriptMaker.waiting_for_topic)
+    await call.answer()
 
 
-@dp.message(F.text == "❓ FAQ")
-async def faq_cmd(message: types.Message):
-    await message.answer(FAQ_TEXT, parse_mode="HTML")
-
-
-# ---------------------------------------------------------------------------
-# МАССОВАЯ ГЕНЕРАЦИЯ
-# ---------------------------------------------------------------------------
-
-class BulkMaker(StatesGroup):
-    waiting_for_topics    = State()
-    waiting_for_style     = State()
-    waiting_for_duration  = State()
-    waiting_for_template  = State()
-
-
-@dp.message(F.text == "🗂 Массовая генерация")
-async def bulk_start(message: types.Message, state: FSMContext):
-    await message.answer(
+@dp.callback_query(F.data == "m_bulk")
+async def cb_bulk(call: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.message.answer(
         "🗂 <b>Массовая генерация</b>\n\n"
         "Введи темы сценариев — <b>каждая с новой строки</b>, до 5 тем:\n\n"
         "<i>Пример:\n"
         "История Tesla\n"
         "Как работает ChatGPT\n"
         "Тайны Бермудского треугольника</i>",
-        reply_markup=types.ReplyKeyboardRemove(), parse_mode="HTML",
+        parse_mode="HTML",
     )
     await state.set_state(BulkMaker.waiting_for_topics)
+    await call.answer()
+
+
+@dp.message(F.text == "🎬 Создать сценарий")
+async def start_script(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer(
+        "🎬 <b>Новый сценарий</b>\n\nО чём видео? Напиши тему.",
+        parse_mode="HTML",
+    )
+    await state.set_state(ScriptMaker.waiting_for_topic)
+
+
+@dp.message(ScriptMaker.waiting_for_topic)
+async def process_topic(message: types.Message, state: FSMContext):
+    text = message.text.strip()
+    if len(text) > 4096:
+        await message.answer("⚠️ Слишком длинный текст. Сократи до 4096 символов.")
+        return
+    topic, factual = detect_factual_content(text)
+    await state.update_data(topic=topic, factual=factual)
+    hint = (
+        f"\n\n✅ <i>Обнаружена фактура ({len(factual.split())} слов) — будет использована при генерации.</i>"
+        if factual else ""
+    )
+    await message.answer(
+        f"📌 Тема: <b>{topic[:100]}</b>{hint}\n\nВыбери жанр сценария:",
+        reply_markup=get_style_inline_kb(), parse_mode="HTML",
+    )
+    await state.set_state(ScriptMaker.waiting_for_style)
+
+
+@dp.message(ScriptMaker.waiting_for_duration)
+async def process_duration_manual(message: types.Message, state: FSMContext):
+    """Ручной ввод длительности (кнопка «Другое»)."""
+    if not message.text.isdigit() or int(message.text) < 1:
+        await message.answer("⚠️ Введи число минут, например: <b>45</b>", parse_mode="HTML")
+        return
+    await _process_duration_value(message, state, int(message.text))
+
+
+@dp.message(ScriptMaker.waiting_for_template)
+async def process_template_fallback(message: types.Message, state: FSMContext):
+    """Fallback — шаблон выбирается через inline-кнопки."""
+    await message.answer(
+        "Выбери шаблон из списка:",
+        reply_markup=await get_templates_inline_kb(for_generation=True),
+    )
+
+
+# ---------------------------------------------------------------------------
+# CALLBACK: ВЫБОР ЖАНРА
+# ---------------------------------------------------------------------------
+
+STYLE_CB_MAP = {
+    "style_fiction":     "fiction",
+    "style_documentary": "documentary",
+    "style_educational": "educational",
+}
+
+STYLE_DESCRIPTIONS_CB = {
+    "style_fiction": (
+        "🎭 <b>Художественный</b>\n\n"
+        "История через персонажей: их мысли, диалоги, поступки и эмоции. "
+        "Бот создаёт сцены, выстраивает напряжение и ведёт зрителя через сюжет.\n\n"
+        "<b>Когда выбирать:</b> если в центре — конкретный человек и его история.\n\n"
+        "<b>Примеры тем:</b>\n"
+        "— Биографическая драма о реальном человеке\n"
+        "— История краха и возрождения\n"
+        "— Криминальный сюжет с несколькими героями"
+    ),
+    "style_documentary": (
+        "📰 <b>Документальный</b>\n\n"
+        "Строгая хронология, только реальные факты и события. "
+        "Бот работает как журналист: выстраивает цепочку событий, называет даты и имена.\n\n"
+        "<b>Когда выбирать:</b> если важна достоверность и последовательность.\n\n"
+        "<b>Примеры тем:</b>\n"
+        "— Хроника реального события или скандала\n"
+        "— Биография с акцентом на факты и даты\n"
+        "— Расследование с доказательствами"
+    ),
+    "style_educational": (
+        "🎓 <b>Познавательный</b>\n\n"
+        "Объяснение через аналогии, примеры и логику — от простого к сложному.\n\n"
+        "<b>Когда выбирать:</b> если главное — объяснить, а не рассказать историю.\n\n"
+        "<b>Примеры тем:</b>\n"
+        "— Как работает какое-то явление или процесс\n"
+        "— Разбор психологии, науки, экономики\n"
+        "— История идеи или открытия"
+    ),
+}
+
+
+async def _after_style_cb(call: types.CallbackQuery, state: FSMContext, next_state):
+    script_style = STYLE_CB_MAP.get(call.data, "documentary")
+    await state.update_data(script_style=script_style)
+    desc = STYLE_DESCRIPTIONS_CB.get(call.data, "")
+    text = f"{desc}\n\nУкажи длительность сценария:" if desc else "Укажи длительность:"
+    await call.message.answer(text, reply_markup=get_duration_inline_kb(), parse_mode="HTML")
+    await state.set_state(next_state)
+    await call.answer()
+
+
+@dp.callback_query(ScriptMaker.waiting_for_style, F.data.startswith("style_"))
+async def cb_style_script(call: types.CallbackQuery, state: FSMContext):
+    await _after_style_cb(call, state, ScriptMaker.waiting_for_duration)
+
+
+@dp.callback_query(BulkMaker.waiting_for_style, F.data.startswith("style_"))
+async def cb_style_bulk(call: types.CallbackQuery, state: FSMContext):
+    await _after_style_cb(call, state, BulkMaker.waiting_for_duration)
+
+
+# ---------------------------------------------------------------------------
+# CALLBACK: ВЫБОР ДЛИТЕЛЬНОСТИ
+# ---------------------------------------------------------------------------
+
+DURATION_PRESETS = {
+    "dur_15": 15, "dur_30": 30, "dur_45": 45,
+    "dur_60": 60, "dur_90": 90, "dur_120": 120,
+}
+
+
+async def _process_duration_value(target, state: FSMContext, duration: int, is_bulk: bool = False):
+    user_id    = target.from_user.id
+    model_id   = await get_user_model(user_id)
+    cost       = calc_cost(model_id, duration)
+    balance    = await get_balance(user_id)
+    model_name = MODEL_NAMES.get(model_id, model_id)
+
+    await state.update_data(duration=duration, words_target=duration * WORDS_PER_MINUTE)
+
+    disclaimer = (
+        f"ℹ️ <b>Как считается хронометраж</b>\n"
+        f"Расчёт идёт из <b>{WORDS_PER_MINUTE} слов/мин</b> — средний темп озвучки.\n"
+        f"Каждый диктор говорит в своём темпе. "
+        f"Рекомендуем закладывать на <b>10–15 мин больше</b> желаемого.\n"
+        f"Списывается фактически — по словам в готовом сценарии.\n\n"
+    )
+    cost_line = (
+        f"💰 Макс. стоимость ({model_name}, {duration} мин): <b>{cost:.1f} кред.</b>\n"
+        f"Баланс: <b>{balance:.1f} кред.</b>\n\n"
+    )
+
+    if balance < cost:
+        msg = f"❌ <b>Недостаточно кредитов</b>\n\n{cost_line}Нажми <b>💳 Пополнить</b>."
+        kb  = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💳 Пополнить", callback_data="m_topup"),
+             InlineKeyboardButton(text="🔙 В меню",    callback_data="m_menu")],
+        ])
+        if isinstance(target, types.CallbackQuery):
+            await target.message.answer(msg, reply_markup=kb, parse_mode="HTML")
+            await target.answer()
+        else:
+            await target.answer(msg, reply_markup=kb, parse_mode="HTML")
+        await state.clear()
+        return False
+
+    kb   = await get_templates_inline_kb(for_generation=True)
+    text = f"{disclaimer}{cost_line}Выбери шаблон:"
+    if isinstance(target, types.CallbackQuery):
+        await target.message.answer(text, reply_markup=kb, parse_mode="HTML")
+        await target.answer()
+    else:
+        await target.answer(text, reply_markup=kb, parse_mode="HTML")
+
+    next_state = BulkMaker.waiting_for_template if is_bulk else ScriptMaker.waiting_for_template
+    await state.set_state(next_state)
+    return True
+
+
+@dp.callback_query(ScriptMaker.waiting_for_duration, F.data.in_(DURATION_PRESETS))
+async def cb_dur_script(call: types.CallbackQuery, state: FSMContext):
+    await _process_duration_value(call, state, DURATION_PRESETS[call.data])
+
+
+@dp.callback_query(BulkMaker.waiting_for_duration, F.data.in_(DURATION_PRESETS))
+async def cb_dur_bulk(call: types.CallbackQuery, state: FSMContext):
+    await _process_duration_value(call, state, DURATION_PRESETS[call.data], is_bulk=True)
+
+
+@dp.callback_query(F.data == "dur_custom")
+async def cb_dur_custom(call: types.CallbackQuery):
+    await call.message.answer("Введи длительность в минутах (число):")
+    await call.answer()
+
+
+@dp.callback_query(F.data == "dur_back")
+async def cb_dur_back(call: types.CallbackQuery, state: FSMContext):
+    await call.message.answer("Выбери жанр сценария:", reply_markup=get_style_inline_kb())
+    cur = await state.get_state()
+    if cur and "Bulk" in (cur or ""):
+        await state.set_state(BulkMaker.waiting_for_style)
+    else:
+        await state.set_state(ScriptMaker.waiting_for_style)
+    await call.answer()
+
+
+# ---------------------------------------------------------------------------
+# CALLBACK: ВЫБОР ШАБЛОНА
+# ---------------------------------------------------------------------------
+
+async def _get_template_by_index(idx: int):
+    templates = await get_templates()
+    names = list(templates.keys())
+    if idx >= len(names):
+        return None
+    name = names[idx]
+    return name, templates[name]
+
+
+@dp.callback_query(ScriptMaker.waiting_for_template, F.data.startswith("tpl_"))
+async def cb_tpl_script(call: types.CallbackQuery, state: FSMContext):
+    if call.data == "tpl_new":
+        await call.message.answer("Введи название нового шаблона:")
+        await state.set_state(TemplateManager.waiting_for_new_name)
+        await call.answer()
+        return
+    idx = int(call.data.split("_")[1])
+    result = await _get_template_by_index(idx)
+    if not result:
+        await call.answer("Шаблон не найден")
+        return
+    tpl_name, style_prompt = result
+    data           = await state.get_data()
+    model_id       = await get_user_model(call.from_user.id)
+    friendly_model = MODEL_NAMES.get(model_id, "AI")
+    duration       = data["duration"]
+    cost           = calc_cost(model_id, duration)
+    balance        = await get_balance(call.from_user.id)
+
+    if balance < cost:
+        await call.message.answer(
+            f"❌ <b>Недостаточно кредитов</b>\nНужно: <b>{cost:.1f}</b> | Баланс: <b>{balance:.1f}</b>",
+            reply_markup=get_main_inline_kb(), parse_mode="HTML",
+        )
+        await state.clear()
+        await call.answer()
+        return
+
+    task_id   = f"{random.randint(100,999)} {random.randint(100,999)} {random.randint(100,999)}"
+    file_name = f"script_{task_id.replace(' ', '_')}.txt"
+    await log_task(task_id, call.from_user.id, data["topic"], friendly_model)
+    await call.answer("🚀 Запускаю…")
+    asyncio.create_task(
+        _run_generation(call.message, data, style_prompt, model_id,
+                        friendly_model, duration, cost, task_id, file_name)
+    )
+    await state.clear()
+
+
+@dp.callback_query(BulkMaker.waiting_for_template, F.data.startswith("tpl_"))
+async def cb_tpl_bulk(call: types.CallbackQuery, state: FSMContext):
+    if call.data == "tpl_new":
+        await call.message.answer("Введи название нового шаблона:")
+        await state.set_state(TemplateManager.waiting_for_new_name)
+        await call.answer()
+        return
+    idx = int(call.data.split("_")[1])
+    result = await _get_template_by_index(idx)
+    if not result:
+        await call.answer("Шаблон не найден")
+        return
+    tpl_name, style_prompt = result
+    data       = await state.get_data()
+    topics     = data["topics"]
+    model_id   = await get_user_model(call.from_user.id)
+    duration   = data["duration"]
+    cost_each  = calc_cost(model_id, duration)
+    cost_total = cost_each * len(topics)
+    balance    = await get_balance(call.from_user.id)
+
+    if balance < cost_total:
+        await call.message.answer(
+            f"❌ Баланс изменился. Нужно: <b>{cost_total:.1f}</b>, есть: <b>{balance:.1f}</b>",
+            reply_markup=get_main_inline_kb(), parse_mode="HTML",
+        )
+        await state.clear()
+        await call.answer()
+        return
+
+    await call.message.answer(
+        f"🚀 Запускаю генерацию <b>{len(topics)}</b> сценариев…\nКаждый будет отправлен по готовности.",
+        parse_mode="HTML",
+    )
+    await state.clear()
+    await call.answer()
+
+    friendly_model = MODEL_NAMES.get(model_id, "AI")
+    for topic in topics:
+        fake_data = {
+            "topic": topic, "factual": "",
+            "script_style": data.get("script_style", "documentary"),
+            "duration": duration, "words_target": duration * WORDS_PER_MINUTE,
+        }
+        task_id   = f"{random.randint(100,999)} {random.randint(100,999)} {random.randint(100,999)}"
+        file_name = f"script_{task_id.replace(' ', '_')}.txt"
+        await log_task(task_id, call.from_user.id, topic, friendly_model)
+        asyncio.create_task(
+            _run_generation(call.message, fake_data, style_prompt, model_id,
+                            friendly_model, duration, cost_each, task_id, file_name)
+        )
+        await asyncio.sleep(1)
+
 
 
 @dp.message(BulkMaker.waiting_for_topics)
@@ -1212,586 +1820,31 @@ async def bulk_topics(message: types.Message, state: FSMContext):
     await state.update_data(topics=topics)
     await message.answer(
         f"✅ Принято {len(topics)} тем.\n\nВыбери жанр (для всех сразу):",
-        reply_markup=get_style_kb(), parse_mode="HTML",
+        reply_markup=get_style_inline_kb(), parse_mode="HTML",
     )
     await state.set_state(BulkMaker.waiting_for_style)
 
 
 @dp.message(BulkMaker.waiting_for_style)
 async def bulk_style(message: types.Message, state: FSMContext):
-    if message.text == "🔙 Назад в меню":
-        return await back_to_main(message, state)
-    if message.text not in STYLE_MAP:
-        await message.answer("Выбери жанр из списка:", reply_markup=get_style_kb())
-        return
-    await state.update_data(script_style=STYLE_MAP[message.text])
-    description = STYLE_DESCRIPTIONS.get(message.text, "")
-    await message.answer(
-        f"{description}\n\n"
-        "Укажи длительность каждого сценария в минутах:",
-        reply_markup=types.ReplyKeyboardRemove(),
-        parse_mode="HTML",
-    )
-    await state.set_state(BulkMaker.waiting_for_duration)
+    # Жанр теперь выбирается через inline-кнопки (cb_style_bulk)
+    # Это сообщение — fallback если пользователь написал текстом
+    await message.answer("Выбери жанр из списка:", reply_markup=get_style_inline_kb())
 
 
 @dp.message(BulkMaker.waiting_for_duration)
 async def bulk_duration(message: types.Message, state: FSMContext):
+    """Ручной ввод длительности для массовой генерации (кнопка «Другое»)."""
     if not message.text.isdigit() or int(message.text) < 1:
         await message.answer("⚠️ Введи число, например: <b>30</b>", parse_mode="HTML")
         return
-    duration   = int(message.text)
-    model_id   = await get_user_model(message.from_user.id)
-    data       = await state.get_data()
-    topics     = data["topics"]
-    cost_each  = calc_cost(model_id, duration)
-    cost_total = cost_each * len(topics)
-    balance    = await get_balance(message.from_user.id)
-    model_name = MODEL_NAMES.get(model_id, model_id)
-
-    await state.update_data(duration=duration, words_target=duration * WORDS_PER_MINUTE)
-
-    disclaimer = (
-        f"ℹ️ <b>Как считается хронометраж</b>\n"
-        f"Расчёт идёт из <b>{WORDS_PER_MINUTE} слов/мин</b> — средний темп озвучки.\n"
-        f"Каждый диктор говорит в своём темпе. Рекомендуем закладывать "
-        f"на <b>10–15 мин больше</b> желаемого хронометража.\n"
-        f"Списывается фактически — по словам в готовом сценарии.\n\n"
-    )
-
-    if balance < cost_total:
-        await message.answer(
-            f"❌ <b>Недостаточно кредитов</b>\n\n"
-            f"Нужно: <b>{cost_total:.1f}</b> ({len(topics)} × {cost_each:.1f})\n"
-            f"Баланс: <b>{balance:.1f}</b>\n\n"
-            "Нажми <b>💳 Пополнить</b> для пополнения.",
-            reply_markup=get_main_kb(), parse_mode="HTML",
-        )
-        await state.clear()
-        return
-
-    await message.answer(
-        f"{disclaimer}"
-        f"💰 Макс. итого: <b>{cost_total:.1f} кред.</b> ({len(topics)} × {cost_each:.1f}, {model_name}, {duration} мин)\n"
-        f"Баланс: <b>{balance:.1f} кред.</b> | Списывается по факту.\n\n"
-        "Выбери шаблон (применится ко всем темам):",
-        reply_markup=await get_dynamic_templates_kb(for_generation=True), parse_mode="HTML",
-    )
-    await state.set_state(BulkMaker.waiting_for_template)
+    await _process_duration_value(message, state, int(message.text), is_bulk=True)
 
 
 @dp.message(BulkMaker.waiting_for_template)
 async def bulk_generate(message: types.Message, state: FSMContext):
-    global _active_tasks
-    if message.text == "🔙 Назад в меню":
-        return await back_to_main(message, state)
-    if message.text == "➕ Создать новый шаблон":
-        await message.answer("Введи название:", reply_markup=types.ReplyKeyboardRemove())
-        await state.set_state(TemplateManager.waiting_for_new_name)
-        return
-
-    templates = await get_templates()
-    if message.text not in templates:
-        await message.answer("Выбери из списка:", reply_markup=await get_dynamic_templates_kb(for_generation=True))
-        return
-
-    style_prompt = templates[message.text]
-    data         = await state.get_data()
-    topics       = data["topics"]
-    model_id     = await get_user_model(message.from_user.id)
-    duration     = data["duration"]
-    cost_each    = calc_cost(model_id, duration)
-    cost_total   = cost_each * len(topics)
-    balance      = await get_balance(message.from_user.id)
-
-    if balance < cost_total:
-        await message.answer(
-            f"❌ Баланс изменился. Нужно: <b>{cost_total:.1f}</b>, есть: <b>{balance:.1f}</b>",
-            reply_markup=get_main_kb(), parse_mode="HTML",
-        )
-        await state.clear()
-        return
-
-    await message.answer(
-        f"🚀 Запускаю генерацию <b>{len(topics)}</b> сценариев...\n"
-        f"Каждый будет отправлен по готовности.",
-        reply_markup=get_main_kb(), parse_mode="HTML",
-    )
-    await state.clear()
-
-    for topic in topics:
-        # Подготавливаем данные как для одиночной генерации
-        fake_state_data = {
-            "topic": topic,
-            "factual": "",
-            "script_style": data.get("script_style", "documentary"),
-            "duration": duration,
-            "words_target": duration * WORDS_PER_MINUTE,
-        }
-        task_id   = f"{random.randint(100,999)} {random.randint(100,999)} {random.randint(100,999)}"
-        file_name = f"script_{task_id.replace(' ', '_')}.txt"
-        friendly_model = MODEL_NAMES.get(model_id, "AI")
-
-        if _generation_semaphore is None:
-            await message.answer(f"❌ Ошибка: бот не готов. Тема «{topic}» пропущена.")
-            continue
-
-        await log_task(task_id, message.from_user.id, topic, friendly_model)
-        asyncio.create_task(
-            _run_generation(message, fake_state_data, style_prompt, model_id,
-                            friendly_model, duration, cost_each, task_id, file_name)
-        )
-        await asyncio.sleep(1)  # небольшая пауза между запусками
-
-# ---------------------------------------------------------------------------
-# БАЛАНС
-# ---------------------------------------------------------------------------
-
-@dp.message(Command("balance"))
-@dp.message(F.text == "💰 Баланс")
-async def balance_cmd(message: types.Message):
-    user_id = message.from_user.id
-    balance = await get_balance(user_id)
-    txs     = await get_transactions(user_id, limit=7)
-    user    = await get_or_create_user(user_id)
-
-    text = f"💰 <b>Баланс: {balance:.1f} кредитов</b>\n\n📋 <b>Последние операции:</b>\n"
-    for tx in txs:
-        sign = "+" if tx["amount"] > 0 else ""
-        text += f"  {sign}{tx['amount']:.1f} — {tx['description']} <i>({tx['created_at']})</i>\n"
-    if not txs:
-        text += "  <i>Операций нет</i>\n"
-
-    text += f"\n🔗 Реферальный код: <code>{user['referral_code']}</code>"
-    await message.answer(text, parse_mode="HTML")
-
-# ---------------------------------------------------------------------------
-# ПОПОЛНЕНИЕ
-# ---------------------------------------------------------------------------
-
-@dp.message(F.text == "💳 Пополнить")
-async def topup_cmd(message: types.Message):
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text=f"{name} — {price}₽  →  {base+bonus} кред.",
-            callback_data=f"pkg_{i}",
-        )]
-        for i, (price, base, bonus, name) in enumerate(CREDIT_PACKAGES)
-    ])
-    await message.answer(
-        "💳 <b>Выберите пакет пополнения:</b>\n\n"
-        "<i>Платёжная система подключается — скоро будет автоплатёж.\n"
-        "Пока свяжитесь с поддержкой для ручного пополнения.</i>",
-        reply_markup=kb, parse_mode="HTML",
-    )
-
-
-@dp.callback_query(F.data.startswith("pkg_"))
-async def pkg_selected(call: types.CallbackQuery):
-    idx = int(call.data.split("_")[1])
-    price, base, bonus, name = CREDIT_PACKAGES[idx]
-    total = base + bonus
-    await call.message.answer(
-        f"📦 Пакет <b>{name}</b>\n"
-        f"💳 Сумма: <b>{price}₽</b>\n"
-        f"🎁 Получите: <b>{total} кредитов</b>\n\n"
-        f"Для оплаты напишите в поддержку с указанием:\n"
-        f"• Пакет: <b>{name}</b>\n"
-        f"• Ваш ID: <code>{call.from_user.id}</code>",
-        parse_mode="HTML",
-    )
-    await call.answer()
-
-# ---------------------------------------------------------------------------
-# ТАРИФЫ И ПАКЕТЫ
-# ---------------------------------------------------------------------------
-
-@dp.message(F.text == "📋 Тарифы")
-async def tariffs_cmd(message: types.Message):
-    await message.answer(TARIFFS_TEXT, parse_mode="HTML")
-
-
-@dp.message(F.text == "📦 Пакеты")
-async def packages_cmd(message: types.Message):
-    await message.answer(build_packages_text(), parse_mode="HTML")
-
-# ---------------------------------------------------------------------------
-# РЕФЕРАЛЬНАЯ ПРОГРАММА
-# ---------------------------------------------------------------------------
-
-@dp.message(F.text == "👥 Реферальная программа")
-async def referral_cmd(message: types.Message):
-    user     = await get_or_create_user(message.from_user.id)
-    bot_info = await bot.get_me()
-    ref_code = user["referral_code"]
-    ref_link = f"https://t.me/{bot_info.username}?start={ref_code}"
-
-    # Inline-кнопка позволяет поделиться ссылкой в один тап
-    share_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text="📤 Поделиться ссылкой",
-            url=f"https://t.me/share/url?url={ref_link}&text=Попробуй%20этот%20бот%20для%20генерации%20YouTube-сценариев!",
-        )],
-    ])
-
-    await message.answer(
-        "👥 <b>Реферальная программа</b>\n\n"
-        "Приглашайте друзей и получайте бонусы!\n\n"
-        f"🔗 Ваша ссылка (нажми чтобы скопировать):\n"
-        f"<code>{ref_link}</code>\n\n"
-        "<b>Условия:</b>\n"
-        f"• Вы получаете <b>{REFERRAL_BONUS_INVITER} кредитов</b> "
-        f"когда приглашённый делает первое пополнение\n"
-        f"• Приглашённый получает <b>+{REFERRAL_BONUS_INVITEE_PCT}%</b> "
-        f"бонусных кредитов к первому пополнению\n\n"
-        "<i>Бонус начисляется автоматически после первой оплаты друга.</i>",
-        reply_markup=share_kb,
-        parse_mode="HTML",
-    )
-
-# ---------------------------------------------------------------------------
-# НАСТРОЙКИ
-# ---------------------------------------------------------------------------
-
-@dp.message(F.text == "⚙️ Настройки")
-async def settings_menu(message: types.Message):
-    cur      = await get_user_model(message.from_user.id)
-    friendly = MODEL_NAMES.get(cur, cur)
-    await message.answer(
-        f"⚙️ <b>Настройки</b>\n\nТекущая модель: <b>{friendly}</b>",
-        reply_markup=get_models_kb(), parse_mode="HTML",
-    )
-
-
-@dp.message(F.text.in_(MODEL_NAMES.values()))
-async def change_model(message: types.Message):
-    inv = {v: k for k, v in MODEL_NAMES.items()}
-    await set_user_model(message.from_user.id, inv[message.text])
-    await message.answer(
-        f"✅ Модель изменена на: <b>{message.text}</b>",
-        reply_markup=get_main_kb(), parse_mode="HTML",
-    )
-
-# ---------------------------------------------------------------------------
-# ШАБЛОНЫ
-# ---------------------------------------------------------------------------
-
-@dp.message(F.text == "📁 Шаблоны")
-async def templates_menu(message: types.Message):
-    templates = await get_templates()
-    text = "📂 <b>Твои шаблоны:</b>\n\n"
-    if not templates:
-        text += "Пусто."
-    else:
-        for name, prompt in templates.items():
-            text += f"🔹 <b>{name}</b>\n<i>{prompt[:60]}...</i>\n\n"
-    await message.answer(text, reply_markup=get_templates_menu_kb(), parse_mode="HTML")
-
-
-@dp.message(F.text == "➕ Добавить шаблон")
-async def add_template_start(message: types.Message, state: FSMContext):
-    await message.answer("Введи название:", reply_markup=types.ReplyKeyboardRemove())
-    await state.set_state(TemplateManager.waiting_for_new_name)
-
-
-@dp.message(F.text == "✏️ Изменить шаблон")
-async def edit_template_start(message: types.Message, state: FSMContext):
-    await message.answer("Какой шаблон хочешь изменить?", reply_markup=await get_dynamic_templates_kb())
-    await state.set_state(TemplateManager.waiting_for_edit_name)
-
-
-@dp.message(TemplateManager.waiting_for_edit_name)
-async def edit_template_pick(message: types.Message, state: FSMContext):
-    if message.text == "🔙 Назад в меню":
-        return await back_to_main(message, state)
-    templates = await get_templates()
-    if message.text not in templates:
-        await message.answer("Выбери из списка:", reply_markup=await get_dynamic_templates_kb())
-        return
-    current_prompt = templates[message.text]
-    await state.update_data(template_name=message.text)
-    await message.answer(
-        f"✏️ Шаблон: <b>{message.text}</b>\n\n"
-        f"📄 Текущий промпт:\n<blockquote>{current_prompt}</blockquote>\n\n"
-        f"Отправь новый текст промпта:",
-        reply_markup=types.ReplyKeyboardRemove(), parse_mode="HTML",
-    )
-    await state.set_state(TemplateManager.waiting_for_new_prompt)
-
-
-@dp.message(TemplateManager.waiting_for_new_name)
-async def add_template_name(message: types.Message, state: FSMContext):
-    if message.text == "🔙 Назад в меню":
-        return await back_to_main(message, state)
-    await state.update_data(template_name=message.text)
-    await message.answer("Отправь текст промпта:", reply_markup=types.ReplyKeyboardRemove())
-    await state.set_state(TemplateManager.waiting_for_new_prompt)
-
-
-@dp.message(TemplateManager.waiting_for_new_prompt)
-async def add_template_prompt(message: types.Message, state: FSMContext):
-    data = await state.get_data()
-    await add_template(data["template_name"], message.text)
-    if "topic" in data:
-        await message.answer(
-            f"✅ Шаблон <b>{data['template_name']}</b> сохранён!\n"
-            f"Продолжаем: <i>{data['topic']}</i>. Выберите шаблон:",
-            reply_markup=await get_dynamic_templates_kb(for_generation=True), parse_mode="HTML",
-        )
-        await state.set_state(ScriptMaker.waiting_for_template)
-    else:
-        await message.answer("✅ Сохранён!", reply_markup=get_main_kb())
-        await state.clear()
-
-
-@dp.message(F.text == "🗑 Удалить шаблон")
-async def delete_template_start(message: types.Message, state: FSMContext):
-    await message.answer("Что удалить?", reply_markup=await get_dynamic_templates_kb())
-    await state.set_state(TemplateManager.waiting_for_delete_name)
-
-
-@dp.message(TemplateManager.waiting_for_delete_name)
-async def delete_template_confirm(message: types.Message, state: FSMContext):
-    if message.text == "🔙 Назад в меню":
-        return await back_to_main(message, state)
-    await delete_template(message.text)
-    await message.answer(f"🗑 Удалено: {message.text}", reply_markup=get_templates_menu_kb())
-    await state.clear()
-
-# ---------------------------------------------------------------------------
-# ОТМЕНА
-# ---------------------------------------------------------------------------
-
-@dp.callback_query(F.data.startswith("cancel_"))
-async def cancel_task_handler(call: types.CallbackQuery):
-    task_id = call.data.replace("cancel_", "")
-    await update_task_status(task_id, "Cancelled")
-    try:
-        await call.message.edit_text(
-            f"🛑 <b>Генерация отменена</b>\n\n🆔 ID: <code>{task_id}</code>",
-            parse_mode="HTML",
-        )
-    except Exception:
-        pass
-    await call.message.answer(
-        "Хочешь создать новый сценарий?",
-        reply_markup=ReplyKeyboardMarkup(keyboard=[
-            [KeyboardButton(text="🎬 Создать сценарий")],
-            [KeyboardButton(text="🔙 Назад в меню")],
-        ], resize_keyboard=True),
-    )
-    await call.answer()
-
-# ---------------------------------------------------------------------------
-# СОЗДАНИЕ СЦЕНАРИЯ
-# ---------------------------------------------------------------------------
-
-@dp.message(F.text == "🎬 Создать сценарий")
-async def start_script(message: types.Message, state: FSMContext):
-    await message.answer(
-        "О чём видео?\n\n"
-        "<i>Можешь вставить просто тему или тему + фактуру (цитаты, даты, факты) — "
-        "бот разберётся сам.</i>",
-        reply_markup=types.ReplyKeyboardRemove(), parse_mode="HTML",
-    )
-    await state.set_state(ScriptMaker.waiting_for_topic)
-
-
-@dp.message(ScriptMaker.waiting_for_topic)
-async def process_topic(message: types.Message, state: FSMContext):
-    text = message.text.strip()
-    if len(text) > 4096:
-        await message.answer("⚠️ Слишком длинный текст. Сократи до 4096 символов.")
-        return
-
-    topic, factual = detect_factual_content(text)
-    await state.update_data(topic=topic, factual=factual)
-
-    hint = ""
-    if factual:
-        hint = f"\n\n✅ <i>Обнаружена фактура ({len(factual.split())} слов) — будет использована при генерации.</i>"
-
-    await message.answer(
-        f"📌 Тема: <b>{topic[:100]}</b>{hint}\n\nВыбери жанр сценария:",
-        reply_markup=get_style_kb(), parse_mode="HTML",
-    )
-    await state.set_state(ScriptMaker.waiting_for_style)
-
-
-STYLE_MAP = {
-    "🎭 Художественный": "fiction",
-    "📰 Документальный": "documentary",
-    "🎓 Познавательный": "educational",
-}
-
-STYLE_DESCRIPTIONS = {
-    "🎭 Художественный": (
-        "🎭 <b>Художественный</b>\n\n"
-        "История рассказывается через персонажей: их мысли, диалоги, поступки и эмоции. "
-        "Бот создаёт сцены, выстраивает напряжение и ведёт зрителя через сюжет.\n\n"
-        "<b>Когда выбирать:</b> если в центре — конкретный человек и его история. "
-        "Важно не что случилось, а <i>как это переживалось</i>.\n\n"
-        "<b>Примеры тем:</b>\n"
-        "— Биографическая драма о реальном человеке\n"
-        "— История краха и возрождения\n"
-        "— Криминальный сюжет с несколькими героями\n"
-        "— Жизненная история с неожиданным финалом"
-    ),
-    "📰 Документальный": (
-        "📰 <b>Документальный</b>\n\n"
-        "Строгая хронология, только реальные факты и события. "
-        "Бот работает как журналист: выстраивает цепочку событий, называет даты, имена и последствия.\n\n"
-        "<b>Когда выбирать:</b> если важна достоверность и последовательность. "
-        "Зритель должен узнать <i>что произошло</i> — без выдумки.\n\n"
-        "<b>Примеры тем:</b>\n"
-        "— Хроника реального события или скандала\n"
-        "— Биография с акцентом на факты и даты\n"
-        "— Расследование с доказательствами\n"
-        "— История организации или явления"
-    ),
-    "🎓 Познавательный": (
-        "🎓 <b>Познавательный</b>\n\n"
-        "Объяснение через аналогии, примеры и логику. "
-        "Бот берёт сложную тему и раскладывает её по полочкам — от простого к сложному, "
-        "так чтобы любой понял с первого раза.\n\n"
-        "<b>Когда выбирать:</b> если главное — <i>объяснить</i>, а не рассказать историю. "
-        "Зритель должен уйти с новым пониманием.\n\n"
-        "<b>Примеры тем:</b>\n"
-        "— Как работает какое-то явление или процесс\n"
-        "— Почему люди принимают те или иные решения\n"
-        "— Разбор психологии, науки, экономики\n"
-        "— История идеи или открытия"
-    ),
-}
-
-
-@dp.message(ScriptMaker.waiting_for_style)
-async def process_style(message: types.Message, state: FSMContext):
-    if message.text == "🔙 Назад в меню":
-        return await back_to_main(message, state)
-    if message.text not in STYLE_MAP:
-        await message.answer("Выбери жанр из списка:", reply_markup=get_style_kb())
-        return
-    await state.update_data(script_style=STYLE_MAP[message.text])
-    description = STYLE_DESCRIPTIONS.get(message.text, "")
-    await message.answer(
-        f"{description}\n\n"
-        "Укажи длительность сценария в минутах:",
-        reply_markup=types.ReplyKeyboardRemove(),
-        parse_mode="HTML",
-    )
-    await state.set_state(ScriptMaker.waiting_for_duration)
-
-
-@dp.message(ScriptMaker.waiting_for_duration)
-async def process_duration(message: types.Message, state: FSMContext):
-    if not message.text.isdigit() or int(message.text) < 1:
-        await message.answer("⚠️ Введите число, например: <b>60</b>", parse_mode="HTML")
-        return
-
-    duration    = int(message.text)
-    model_id    = await get_user_model(message.from_user.id)
-    cost        = calc_cost(model_id, duration)
-    balance     = await get_balance(message.from_user.id)
-    model_name  = MODEL_NAMES.get(model_id, model_id)
-    words_est   = duration * WORDS_PER_MINUTE
-
-    await state.update_data(duration=duration, words_target=words_est)
-
-    cost_line = (
-        f"<i>💰 Макс. стоимость ({model_name}, {duration} мин): "
-        f"<b>{cost:.1f} кред.</b> | Баланс: <b>{balance:.1f} кред.</b>\n"
-        f"Списывается фактически — по количеству слов в готовом сценарии.</i>\n\n"
-    )
-
-    disclaimer = (
-        f"ℹ️ <b>Как считается хронометраж</b>\n"
-        f"Расчёт идёт из <b>{WORDS_PER_MINUTE} слов/мин</b> — средний темп озвучки.\n"
-        f"Каждый диктор говорит в своём темпе: кто-то быстрее, кто-то медленнее.\n"
-        f"Рекомендуем закладывать на <b>10–15 мин больше</b> желаемого хронометража.\n\n"
-    )
-
-    if balance < cost:
-        await message.answer(
-            f"❌ <b>Недостаточно кредитов</b>\n\n{cost_line}"
-            "Нажми <b>💳 Пополнить</b> чтобы пополнить баланс.",
-            reply_markup=get_main_kb(), parse_mode="HTML",
-        )
-        await state.clear()
-        return
-
-    await message.answer(
-        f"{disclaimer}"
-        f"{cost_line}"
-        "Выбери шаблон:",
-        reply_markup=await get_dynamic_templates_kb(for_generation=True), parse_mode="HTML",
-    )
-    await state.set_state(ScriptMaker.waiting_for_template)
-
-# ---------------------------------------------------------------------------
-# ГЕНЕРАЦИЯ
-# ---------------------------------------------------------------------------
-
-@dp.message(ScriptMaker.waiting_for_template)
-async def generate_script(message: types.Message, state: FSMContext):
-    global _active_tasks
-
-    if message.text == "🔙 Назад в меню":
-        return await back_to_main(message, state)
-    if message.text == "➕ Создать новый шаблон":
-        await message.answer("Введите название:", reply_markup=types.ReplyKeyboardRemove())
-        await state.set_state(TemplateManager.waiting_for_new_name)
-        return
-
-    templates = await get_templates()
-    if message.text not in templates:
-        await message.answer(
-            "Выбери из списка:",
-            reply_markup=await get_dynamic_templates_kb(for_generation=True),
-        )
-        return
-
-    style_prompt   = templates[message.text]
-    data           = await state.get_data()
-    model_id       = await get_user_model(message.from_user.id)
-    friendly_model = MODEL_NAMES.get(model_id, "AI")
-    words_target   = data["words_target"]
-    duration       = data["duration"]
-    user_id        = message.from_user.id
-
-    # Финальная проверка баланса
-    cost    = calc_cost(model_id, duration)
-    balance = await get_balance(user_id)
-    if balance < cost:
-        await message.answer(
-            f"❌ <b>Недостаточно кредитов</b>\n"
-            f"Нужно: <b>{cost:.1f}</b> | Баланс: <b>{balance:.1f}</b>",
-            reply_markup=get_main_kb(), parse_mode="HTML",
-        )
-        await state.clear()
-        return
-
-    task_id   = f"{random.randint(100,999)} {random.randint(100,999)} {random.randint(100,999)}"
-    file_name = f"script_{task_id.replace(' ', '_')}.txt"
-    await log_task(task_id, user_id, data["topic"], friendly_model)
-
-    if _generation_semaphore is None:
-        await message.answer("❌ Бот ещё не готов, попробуй через несколько секунд.")
-        await state.clear()
-        return
-
-    if _active_tasks >= MAX_CONCURRENT_TASKS:
-        await message.answer(
-            "⏳ <b>Все слоты заняты.</b> Задача в очереди — начнётся автоматически.",
-            parse_mode="HTML",
-        )
-
-    asyncio.create_task(
-        _run_generation(message, data, style_prompt, model_id,
-                        friendly_model, duration, cost, task_id, file_name)
-    )
-    await state.clear()
-
+    # Шаблон выбирается через inline-кнопки (cb_tpl_bulk)
+    await message.answer("Выбери шаблон из списка:", reply_markup=await get_templates_inline_kb(for_generation=True))
 
 async def _run_generation(message: types.Message, data: dict, style_prompt: str,
                           model_id: str, friendly_model: str, duration: int,
@@ -1800,6 +1853,7 @@ async def _run_generation(message: types.Message, data: dict, style_prompt: str,
 
     user_id      = message.from_user.id
     words_target = data.get("words_target", duration * WORDS_PER_MINUTE)
+    _generating_users.add(user_id)
 
     await _generation_semaphore.acquire()
     _active_tasks += 1
@@ -2382,12 +2436,8 @@ async def _run_generation(message: types.Message, data: dict, style_prompt: str,
 
         await message.answer(
             f"✅ Готово! Списано <b>{actual_cost:.1f} кред.</b> (по факту){saving_str}\n"
-            f"Остаток: <b>{new_balance:.1f} кред.</b>\n\n"
-            "Создать ещё один?",
-            reply_markup=ReplyKeyboardMarkup(keyboard=[
-                [KeyboardButton(text="🎬 Создать сценарий")],
-                [KeyboardButton(text="🔙 Назад в меню")],
-            ], resize_keyboard=True),
+            f"Остаток: <b>{new_balance:.1f} кред.</b>",
+            reply_markup=get_after_gen_inline_kb(),
             parse_mode="HTML",
         )
 
@@ -2404,6 +2454,7 @@ async def _run_generation(message: types.Message, data: dict, style_prompt: str,
 
     finally:
         _active_tasks -= 1
+        _generating_users.discard(user_id)
         _generation_semaphore.release()
         if os.path.exists(file_name):
             os.remove(file_name)
