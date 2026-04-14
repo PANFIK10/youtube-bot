@@ -412,6 +412,11 @@ async def delete_template(name):
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ---------------------------------------------------------------------------
 
+class APICreditsError(Exception):
+    """Закончились кредиты на OpenRouter — нужно пополнить API-баланс."""
+    pass
+
+
 async def api_call_with_retry(model_id: str, messages: list, max_tokens: int) -> str:
     last_exc = None
     for attempt in range(API_RETRY_ATTEMPTS):
@@ -425,6 +430,12 @@ async def api_call_with_retry(model_id: str, messages: list, max_tokens: int) ->
         except Exception as e:
             last_exc = e
             err_str = str(e).lower()
+            # 402 — кончились кредиты OpenRouter, повторы бессмысленны
+            if "402" in err_str or "require more credits" in err_str or "can only afford" in err_str:
+                raise APICreditsError(
+                    "На API-балансе OpenRouter недостаточно средств. "
+                    "Пополни баланс на openrouter.ai/settings/credits"
+                ) from e
             if any(x in err_str for x in ("rate", "429", "502", "503", "timeout")):
                 delay = API_RETRY_BASE_DELAY * (2 ** attempt)
                 logging.warning(f"API retry {attempt+1}/{API_RETRY_ATTEMPTS}: {delay:.1f}с")
@@ -859,6 +870,8 @@ async def generate_skeleton_chapter(
     try:
         raw = await api_call_with_retry(model_id, [{"role": "user", "content": prompt}], 600)
         return clean_chapter_text(raw).strip() if raw else ""
+    except APICreditsError:
+        raise
     except Exception as e:
         logging.warning(f"Скелет {index+1}: {e}")
         return ""
@@ -937,6 +950,8 @@ async def expand_chapter(
     try:
         raw = await api_call_with_retry(model_id, [{"role": "user", "content": prompt}], max_tokens)
         return strip_cta_from_text(clean_chapter_text(raw)).strip() if raw else ""
+    except APICreditsError:
+        raise
     except Exception as e:
         logging.error(f"Развёртка {index+1}: {e}")
         return ""
@@ -1061,6 +1076,8 @@ async def generate_master_doc(
             1000,
         )
         return result.strip() if result else ""
+    except APICreditsError:
+        raise
     except Exception as e:
         logging.warning(f"Мастер-документ: не удалось создать: {e}")
         return ""
@@ -1136,6 +1153,8 @@ async def generate_mini_briefs(
             briefs[current_idx] = "\n".join(current_lines).strip()
         logging.info(f"[{task_id}] 📝 Мини-брифы: {sum(1 for b in briefs if b)}/{n}")
         return briefs
+    except APICreditsError:
+        raise
     except Exception as e:
         logging.warning(f"[{task_id}] Мини-брифы не удалось сгенерировать: {e}")
         return [""] * n
@@ -2501,6 +2520,8 @@ async def _run_generation(message: types.Message, data: dict, style_prompt: str,
                 clean = clean.rstrip()
                 full_script_parts[index] = clean + "\n\n"
                 logging.info(f"[{task_id}] ✅ {index+1}/{n} — {len(clean.split())} слов")
+            except APICreditsError:
+                raise  # пробрасываем наверх — останавливаем всю генерацию
             except Exception as e:
                 logging.error(f"[{task_id}] ❌ {index+1}: {e}")
                 full_script_parts[index] = ""
@@ -2955,6 +2976,23 @@ async def _run_generation(message: types.Message, data: dict, style_prompt: str,
             parse_mode="HTML",
         )
 
+    except APICreditsError as e:
+        logging.error(f"[{task_id}] ❌ Кончились кредиты OpenRouter: {e}")
+        try:
+            await message.answer(
+                f"⚠️ <b>Генерация остановлена</b>\n\n"
+                f"На API-балансе закончились средства.\n"
+                f"Администратору нужно пополнить баланс на "
+                f"<a href='https://openrouter.ai/settings/credits'>openrouter.ai</a>\n\n"
+                f"🆔 ID задачи: <code>{task_id}</code>\n"
+                f"<i>Твои кредиты НЕ списаны.</i>",
+                parse_mode="HTML",
+                reply_markup=get_after_gen_inline_kb(),
+            )
+        except Exception:
+            pass
+        await update_task_status(task_id, "Error: API credits exhausted")
+
     except Exception as e:
         logging.error(f"[{task_id}] Критическая ошибка: {e}")
         try:
@@ -2962,6 +3000,8 @@ async def _run_generation(message: types.Message, data: dict, style_prompt: str,
                 f"❌ <b>Ошибка</b> {task_id}\n\n<code>{str(e)}</code>",
                 parse_mode="HTML",
             )
+        except Exception:
+            pass
         except Exception:
             pass
         await update_task_status(task_id, f"Error: {str(e)}")
