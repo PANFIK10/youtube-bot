@@ -512,8 +512,8 @@ def strip_cta_from_text(text: str) -> str:
 def inject_cta(parts: list[str], cta_positions: set[int],
                style_prompt: str, topic: str) -> list[str]:
     """
-    Вставляет CTA программно после указанных глав.
-    Генерирует тематический вопрос на основе темы сценария.
+    Вставляет CTA только после полного предложения (точка/восклицание/вопрос).
+    Никогда не разрывает текст посередине.
     """
     if not cta_positions:
         return parts
@@ -522,9 +522,16 @@ def inject_cta(parts: list[str], cta_positions: set[int],
     for idx in sorted(cta_positions):
         if idx >= len(result) or not result[idx]:
             continue
-        # Простой CTA — одно предложение в конце главы
+        text = result[idx].rstrip()
+        # Найти позицию последнего конца предложения
+        last_end = max(
+            text.rfind('.'), text.rfind('!'), text.rfind('?'),
+            text.rfind('»'), text.rfind('…'),
+        )
+        if last_end > len(text) * 0.5:   # конец предложения есть и он не в самом начале
+            text = text[:last_end + 1]
         cta_text = "\n\nНапиши в комментарии одно слово — что ты думаешь об этом?"
-        result[idx] = result[idx].rstrip() + cta_text + "\n\n"
+        result[idx] = text + cta_text + "\n\n"
     return result
 
 
@@ -670,6 +677,269 @@ async def polish_script(model_id: str, text: str, topic: str,
     logging.info(f"[{task_id}] ✨ Полировка завершена ({len(polished.split())} слов, "
                  f"{len(polished_chunks)} чанков)")
     return polished
+
+
+# Порог глав для двухпроходной генерации (скелет → развёртка)
+TWO_PASS_THRESHOLD = 10
+
+
+async def complete_sentence(model_id: str, text: str) -> str:
+    """
+    Если глава обрывается на незавершённом предложении — дописывает его.
+    Дешёвый вызов: просим не более 60 токенов.
+    """
+    stripped = text.rstrip()
+    if stripped and stripped[-1] in '.!?»…':
+        return text
+    try:
+        tail = stripped[-300:]
+        completion = await api_call_with_retry(
+            model_id,
+            [{"role": "user", "content":
+              f"Допиши последнее незавершённое предложение этого текста. "
+              f"Верни ТОЛЬКО недостающую часть предложения (без повтора того что уже есть), "
+              f"заканчивающуюся точкой, восклицательным или вопросительным знаком. "
+              f"Не добавляй ничего лишнего.\n\nТЕКСТ:\n...{tail}"}],
+            80,
+        )
+        if completion and completion.strip():
+            comp = completion.strip()
+            # Убираем повтор если модель всё же повторила хвост
+            if stripped.endswith(comp[:20]):
+                return text
+            return stripped + " " + comp + "\n\n"
+    except Exception:
+        pass
+    return text
+
+
+async def consistency_check_and_fix(
+    model_id: str, text: str, topic: str,
+    script_style: str, master_doc: str, task_id: str
+) -> str:
+    """
+    Финальная проверка консистентности всего сценария:
+    1. Дублированные блоки (одинаковые предложения встречаются дважды)
+    2. Противоречия времени/сезона/места
+    3. Коллизии имён у разных персонажей
+    4. Слипшиеся слова на стыках
+    Работает за два вызова: сначала диагностика, потом точечные правки.
+    """
+    words = text.split()
+    logging.info(f"[{task_id}] 🔍 Консистентность: {len(words)} слов")
+
+    # ── Шаг 1: автоматическая чистка слипшихся слов ────────────────────────
+    import re as _re
+    text = _re.sub(r'([а-яё])([А-ЯЁ])', r'\1 \2', text)       # слипшиеся слова
+    text = _re.sub(r'([а-zA-Zа-яёА-ЯЁ])([a-zA-Z])([а-яёА-ЯЁ])', r'\1\3', text)  # латинские буквы внутри слов
+
+    # ── Шаг 2: поиск дублированных предложений ─────────────────────────────
+    sentences = [s.strip() for s in _re.split(r'(?<=[.!?»])\s+', text) if len(s.strip()) > 50]
+    seen: dict[str, int] = {}
+    duplicate_phrases: list[str] = []
+    for s in sentences:
+        key = s[:70]
+        if key in seen:
+            duplicate_phrases.append(s[:120])
+        else:
+            seen[key] = 1
+    if len(duplicate_phrases) > 0:
+        logging.info(f"[{task_id}] 🔍 Найдено {len(duplicate_phrases)} дублей предложений")
+
+    # ── Шаг 3: запрос к модели на исправление логических ошибок ───────────
+    # Делим текст на чанки по 4000 слов чтобы не превышать контекст
+    CHUNK = 4000
+    words_list = text.split()
+    total      = len(words_list)
+
+    if total == 0:
+        return text
+
+    # Для коротких текстов — один запрос целиком
+    if total <= CHUNK:
+        chunks_to_fix = [text]
+    else:
+        chunks_to_fix = [
+            " ".join(words_list[i:i+CHUNK])
+            for i in range(0, total, CHUNK)
+        ]
+
+    genre_note = {
+        "fiction":     "художественный сценарий с персонажами",
+        "documentary": "документальный сценарий с реальными фактами",
+        "educational": "познавательный сценарий с объяснениями",
+    }.get(script_style, "сценарий")
+
+    dup_block = ""
+    if duplicate_phrases:
+        dup_block = (
+            "\nОБНАРУЖЕНЫ ДУБЛИ — удали второе вхождение каждого:\n"
+            + "\n".join(f"  - «{d}...»" for d in duplicate_phrases[:8])
+            + "\n"
+        )
+
+    fixed_chunks: list[str] = []
+    prev_tail = ""
+
+    for ci, chunk in enumerate(chunks_to_fix):
+        ctx_block = f"КОНЕЦ ПРЕДЫДУЩЕГО БЛОКА (контекст, не редактировать):\n«...{prev_tail}»\n\n" if prev_tail else ""
+        prompt = (
+            f"Ты — финальный редактор {genre_note}.\n"
+            f"ТЕМА: «{topic}»\n\n"
+            f"ЗАДАЧА: найди и исправь ТОЛЬКО следующие проблемы:\n"
+            f"1. Дублированные фрагменты — одно и то же событие/предложение описано дважды → убери второй раз\n"
+            f"2. Противоречия времени/сезона/места — если в одном месте декабрь а в другом апрель без перехода → исправь\n"
+            f"3. Коллизии имён — разные персонажи с одинаковым именем → переименуй второстепенного\n"
+            f"4. Оборванные предложения — предложение начато но не закончено → допиши\n"
+            f"{dup_block}"
+            f"СТРОГО ЗАПРЕЩЕНО:\n"
+            f"— Менять стиль, переформулировать нормальные предложения\n"
+            f"— Добавлять новые события или персонажей\n"
+            f"— Сокращать текст более чем на 5%\n\n"
+            f"Если проблем не найдено — верни текст без изменений.\n"
+            f"Верни ТОЛЬКО исправленный текст.\n\n"
+            f"{ctx_block}"
+            f"ТЕКСТ:\n{chunk}"
+        )
+        try:
+            chunk_words = len(chunk.split())
+            result = await api_call_with_retry(
+                model_id,
+                [{"role": "user", "content": prompt}],
+                min(int(chunk_words * 1.2 * 1.5), 8000),
+            )
+            if result and len(result.split()) > chunk_words * 0.7:
+                fixed_chunks.append(result.strip())
+                prev_tail = " ".join(result.split()[-200:])
+            else:
+                fixed_chunks.append(chunk)
+                prev_tail = " ".join(chunk.split()[-200:])
+        except Exception as e:
+            logging.warning(f"[{task_id}] 🔍 Чанк {ci+1} консистентности не обработан: {e}")
+            fixed_chunks.append(chunk)
+
+        await asyncio.sleep(1)
+
+    result_text = "\n\n".join(fixed_chunks)
+    result_text = _re.sub(r'\n{3,}', '\n\n', result_text)
+    logging.info(f"[{task_id}] ✅ Консистентность: {len(result_text.split())} слов")
+    return result_text
+
+
+async def generate_skeleton_chapter(
+    model_id: str, index: int, title: str, n: int,
+    full_plan_str: str, master_doc: str, style_prompt: str,
+    script_style: str, prev_skeleton: str = "", narrative_state: str = ""
+) -> str:
+    """
+    Первый проход: генерирует краткий скелет главы (~150-200 слов).
+    Только ключевые события, без развёрнутых описаний.
+    """
+    lore_block = f"МАСТЕР-ДОКУМЕНТ:\n{master_doc}\n\n" if master_doc else ""
+    prev_block = f"ПРЕДЫДУЩАЯ ГЛАВА (кратко):\n«...{prev_skeleton[-600:]}»\n\n" if prev_skeleton else ""
+    state_block = f"НАРРАТИВНЫЙ КОНТЕКСТ:\n{narrative_state}\n\n" if narrative_state else ""
+
+    genre_map = {
+        "fiction":     "художественный — только ключевые события и диалоги",
+        "documentary": "документальный — только ключевые факты и даты",
+        "educational": "познавательный — только главный тезис и один пример",
+    }
+
+    prompt = (
+        f"{lore_block}"
+        f"ПЛАН СЦЕНАРИЯ ({n} частей):\n{full_plan_str}\n\n"
+        f"{prev_block}{state_block}"
+        f"ЗАДАЧА: напиши КРАТКИЙ СКЕЛЕТ части №{index+1} — «{title}»\n"
+        f"Жанр: {genre_map.get(script_style, 'сценарий')}\n"
+        f"Объём: ровно 150-200 слов. Только ключевые события/факты — без развёрнутых описаний.\n"
+        f"Это черновик для дальнейшего развёртывания, не финальный текст.\n"
+        f"Стиль: {style_prompt[:100]}\n\n"
+        f"Только текст, без заголовков и пояснений."
+    )
+    try:
+        raw = await api_call_with_retry(model_id, [{"role": "user", "content": prompt}], 600)
+        return clean_chapter_text(raw).strip() if raw else ""
+    except Exception as e:
+        logging.warning(f"Скелет {index+1}: {e}")
+        return ""
+
+
+async def expand_chapter(
+    model_id: str, index: int, title: str, n: int,
+    skeleton: str, full_plan_str: str, master_doc: str,
+    style_prompt: str, script_style: str,
+    prev_full: str = "", next_skeleton: str = "",
+    narrative_state: str = "", words_to_request: int = 400,
+    max_tokens: int = 4096
+) -> str:
+    """
+    Второй проход: разворачивает скелет главы до полного объёма.
+    Ключевое отличие от обычной генерации: глава видит не только предыдущую,
+    но и скелет СЛЕДУЮЩЕЙ части — и знает куда она ведёт.
+    """
+    lore_block = (
+        f"╔══════════════════════════════════╗\n"
+        f"║         МАСТЕР-ДОКУМЕНТ          ║\n"
+        f"╚══════════════════════════════════╝\n"
+        f"{master_doc}\n\n"
+    ) if master_doc else ""
+
+    prev_block = (
+        f"ТАК ЗАКАНЧИВАЕТСЯ ПРЕДЫДУЩАЯ ЧАСТЬ (продолжи отсюда):\n«...{prev_full[-1500:]}»\n\n"
+    ) if prev_full else ""
+
+    next_block = (
+        f"ТАК НАЧНЁТСЯ СЛЕДУЮЩАЯ ЧАСТЬ (закончи так, чтобы туда было логично перейти):\n«{next_skeleton[:400]}...»\n\n"
+    ) if next_skeleton else ""
+
+    state_block = f"НАРРАТИВНАЯ ЭСТАФЕТА:\n{narrative_state}\n\n" if narrative_state else ""
+
+    genre_instructions = {
+        "fiction": (
+            "ЖАНР: художественный. Пиши через персонажей: действия, диалоги, внутренние монологи. "
+            "Эмоции — через детали и поступки, не через прямые описания."
+        ),
+        "documentary": (
+            "ЖАНР: документальный. Только реальные факты из мастер-документа. "
+            "Ничего не придумывай."
+        ),
+        "educational": (
+            "ЖАНР: познавательный. Объясняй через аналогии и примеры. "
+            "От простого к сложному."
+        ),
+    }.get(script_style, "")
+
+    if index == 0:
+        position = "ПЕРВАЯ часть — начни с сильного зацепляющего момента, без вступлений."
+    elif index == n - 1:
+        position = "ПОСЛЕДНЯЯ часть — дай ощущение завершённости."
+    else:
+        position = f"Часть {index+1} из {n} — продолжай нарратив, не начинай заново."
+
+    prompt = (
+        f"{lore_block}"
+        f"ПЛАН СЦЕНАРИЯ ({n} частей):\n{full_plan_str}\n\n"
+        f"{prev_block}{state_block}"
+        f"СКЕЛЕТ ТЕКУЩЕЙ ЧАСТИ (разверни его до полного объёма):\n{skeleton}\n\n"
+        f"{next_block}"
+        f"{genre_instructions}\n\n"
+        f"СЕЙЧАС ПИШЕШЬ: часть №{index+1} — «{title}»\n"
+        f"{position}\n\n"
+        f"ПРАВИЛО: это фрагмент единого сплошного повествования. "
+        f"Не начинай с нуля. Не делай вводных фраз типа «Сегодня мы поговорим». "
+        f"В конце оборви на крючке — не подводи итог.\n\n"
+        f"СТИЛЬ: {style_prompt}\n\n"
+        f"ТЕХНИЧЕСКИЕ ТРЕБОВАНИЯ:\n"
+        f"1. Объём: ровно {words_to_request} слов.\n"
+        f"2. Формат: сплошной текст без заголовков, списков, символов #*-.\n"
+        f"3. ЗАПРЕЩЕНО: вступления, итоги, призывы к зрителям."
+    )
+    try:
+        raw = await api_call_with_retry(model_id, [{"role": "user", "content": prompt}], max_tokens)
+        return strip_cta_from_text(clean_chapter_text(raw)).strip() if raw else ""
+    except Exception as e:
+        logging.error(f"Развёртка {index+1}: {e}")
+        return ""
 
 
 async def generate_master_doc(
@@ -926,7 +1196,8 @@ def get_duration_inline_kb() -> InlineKeyboardMarkup:
          InlineKeyboardButton(text="90 мин", callback_data="dur_90"),
          InlineKeyboardButton(text="120 мин", callback_data="dur_120")],
         [InlineKeyboardButton(text="✏️ Другое число", callback_data="dur_custom")],
-        [InlineKeyboardButton(text="🔙 Назад",        callback_data="dur_back")],
+        [InlineKeyboardButton(text="🔙 Назад к жанру", callback_data="dur_back"),
+         InlineKeyboardButton(text="🏠 В меню",         callback_data="m_menu")],
     ])
 
 def get_models_inline_kb(current_model_id: str = "") -> InlineKeyboardMarkup:
@@ -957,7 +1228,7 @@ def get_templates_menu_inline_kb() -> InlineKeyboardMarkup:
 
 async def get_templates_inline_kb(for_generation: bool = False,
                                   action_prefix: str = "tpl") -> InlineKeyboardMarkup:
-    """Динамическая клавиатура шаблонов. action_prefix: 'tpl' для генерации, 'tedit'/'tdel' для управления."""
+    """Динамическая клавиатура шаблонов."""
     templates = await get_templates()
     rows = []
     for i, name in enumerate(templates):
@@ -965,7 +1236,8 @@ async def get_templates_inline_kb(for_generation: bool = False,
         rows.append([InlineKeyboardButton(text=short, callback_data=f"{action_prefix}_{i}")])
     if for_generation:
         rows.append([InlineKeyboardButton(text="➕ Создать новый шаблон", callback_data="tpl_new")])
-    rows.append([InlineKeyboardButton(text="🔙 В меню", callback_data="m_menu")])
+    rows.append([InlineKeyboardButton(text="🔙 Назад к длительности", callback_data="tpl_back_dur"),
+                 InlineKeyboardButton(text="🏠 В меню", callback_data="m_menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def get_after_gen_inline_kb() -> InlineKeyboardMarkup:
@@ -1052,57 +1324,73 @@ TARIFFS_TEXT = (
 
 FAQ_TEXT = (
     "❓ <b>Частые вопросы</b>\n\n"
-    "──────────────────────────\n"
-    "<b>Как создать сценарий?</b>\n"
-    "Нажми «🎬 Создать сценарий», введи тему, выбери жанр, длительность и шаблон.\n\n"
 
-    "<b>Что такое жанр и как выбрать?</b>\n\n"
+    "━━━━━━━━━━━━━━━━━━━━━━\n"
+    "🚀 <b>КАК НАЧАТЬ</b>\n"
+    "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    "Нажми «🎬 Создать сценарий» → введи тему → выбери жанр → укажи длительность → выбери шаблон.\n"
+    "Готово — через несколько минут получишь файл.\n\n"
 
+    "━━━━━━━━━━━━━━━━━━━━━━\n"
+    "🎬 <b>ЖАНРЫ</b>\n"
+    "━━━━━━━━━━━━━━━━━━━━━━\n\n"
     "🎭 <b>Художественный</b> — история с персонажами, диалогами и сюжетом.\n"
-    "Подходит когда нужна эмоциональная история от лица конкретного человека: "
-    "его путь, испытания, решения. Бот выстраивает сцены, добавляет детали и драму.\n"
-    "<i>Подойдёт для:</i> биографических драм, историй успеха и провала, "
-    "жизненных случаев, криминальных историй с персонажами.\n\n"
-
-    "📰 <b>Документальный</b> — факты, хронология, реальные события.\n"
-    "Подходит когда нужно рассказать о том, что произошло на самом деле — "
-    "без выдумки, только проверяемые данные в логичной последовательности.\n"
-    "<i>Подойдёт для:</i> исторических событий, расследований, "
-    "биографий реальных людей, разборов громких дел.\n\n"
-
+    "Подходит для биографических драм, историй успеха/провала, криминальных историй.\n\n"
+    "📰 <b>Документальный</b> — только факты, хронология, реальные события.\n"
+    "Подходит для расследований, биографий, разборов громких дел.\n\n"
     "🎓 <b>Познавательный</b> — объяснения, аналогии, «почему» и «как».\n"
-    "Подходит когда нужно разобрать явление, процесс или концепцию — "
-    "простым языком, с примерами и логикой.\n"
-    "<i>Подойдёт для:</i> научпопа, психологии, финансов, технологий, "
-    "любой темы где главное — объяснить, а не рассказать историю.\n\n"
+    "Подходит для научпопа, психологии, финансов, технологий.\n\n"
 
-    "──────────────────────────\n"
-    "<b>Как считается хронометраж?</b>\n"
-    f"Длина сценария рассчитывается из <b>{WORDS_PER_MINUTE} слов в минуту</b> — "
-    "это средний темп профессиональной озвучки.\n"
-    "Итоговый хронометраж зависит от диктора: кто-то читает быстрее, кто-то медленнее. "
-    "Рекомендуем заказывать на <b>10–15 минут больше</b> нужного.\n\n"
-    "<i>Пример: хочешь видео на 20 мин — заказывай 30–35 мин.</i>\n"
-    "Списывается только за реально сгенерированные слова.\n\n"
+    "━━━━━━━━━━━━━━━━━━━━━━\n"
+    "⏱ <b>ХРОНОМЕТРАЖ</b>\n"
+    "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    f"Расчёт идёт из <b>{WORDS_PER_MINUTE} слов/мин</b> — средний темп озвучки.\n"
+    "Каждый диктор говорит по-разному, поэтому рекомендуем заказывать на <b>10–15 мин больше</b> нужного.\n"
+    "<i>Пример: хочешь видео на 20 мин — заказывай 30–35.</i>\n"
+    "Кредиты списываются по факту — только за реально сгенерированные слова.\n\n"
 
-    "──────────────────────────\n"
-    "<b>Что такое кредиты?</b>\n"
-    "1 кредит = 1 рубль. Списываются по факту — по количеству слов в готовом сценарии.\n"
-    "Стартовый бонус — 50 кредитов бесплатно.\n\n"
-    "<b>Чем отличаются модели?</b>\n"
-    "🟢 Gemini — быстро и дёшево\n"
-    "🔵 Grok — живой и дерзкий стиль\n"
-    "🟡 Claude Haiku — литературный стиль\n"
-    "🟠 ChatGPT — чёткая логика и структура\n"
-    "🔴 Claude Sonnet — наивысшее качество\n\n"
-    "<b>Что такое шаблоны?</b>\n"
-    "Шаблоны задают стиль подачи: эмоциональный, сухой, от первого лица и т.д.\n"
-    "Можно создавать свои в разделе «📁 Шаблоны».\n\n"
-    "<b>Что такое массовая генерация?</b>\n"
-    "Позволяет создать до 5 сценариев за один раз по разным темам.\n\n"
-    "<b>Как работает реферальная программа?</b>\n"
-    "Приглашай друзей по своей ссылке — получай 25 кредитов после их первой оплаты.\n\n"
-    "──────────────────────────\n"
+    "━━━━━━━━━━━━━━━━━━━━━━\n"
+    "💰 <b>КРЕДИТЫ И ОПЛАТА</b>\n"
+    "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    "1 кредит = 1 рубль.\n"
+    "Стартовый бонус — 50 кредитов бесплатно при регистрации.\n"
+    "Кредиты списываются только после успешной генерации.\n"
+    "Для пополнения: раздел «💳 Пополнить» или напиши @aass11463.\n\n"
+
+    "━━━━━━━━━━━━━━━━━━━━━━\n"
+    "🤖 <b>МОДЕЛИ</b>\n"
+    "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    "🟢 Gemini — 0.15₽/мин — быстро и дёшево\n"
+    "🔵 Grok — 0.25₽/мин — живой и дерзкий стиль\n"
+    "🟡 Claude Haiku — 0.75₽/мин — литературный стиль\n"
+    "🟠 ChatGPT — 1.25₽/мин — чёткая логика\n"
+    "🔴 Claude Sonnet — 2.00₽/мин — наивысшее качество\n\n"
+
+    "━━━━━━━━━━━━━━━━━━━━━━\n"
+    "📁 <b>ШАБЛОНЫ</b>\n"
+    "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    "Шаблон задаёт стиль подачи: эмоциональный, сухой, от первого лица и т.д.\n"
+    "Создавай и редактируй свои шаблоны в разделе «📁 Шаблоны».\n\n"
+
+    "━━━━━━━━━━━━━━━━━━━━━━\n"
+    "🗂 <b>МАССОВАЯ ГЕНЕРАЦИЯ</b>\n"
+    "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    "До 5 сценариев по разным темам за один раз.\n"
+    "Каждый приходит отдельным файлом по готовности.\n\n"
+
+    "━━━━━━━━━━━━━━━━━━━━━━\n"
+    "👥 <b>РЕФЕРАЛЬНАЯ ПРОГРАММА</b>\n"
+    "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    "Приглашай друзей по своей ссылке.\n"
+    "Ты получаешь 25 кредитов после их первой оплаты.\n"
+    "Друг получает +10% бонус к первому пополнению.\n\n"
+
+    "━━━━━━━━━━━━━━━━━━━━━━\n"
+    "📜 <b>ДОКУМЕНТЫ</b>\n"
+    "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    "Публичная оферта: /oferta\n\n"
+
+    "━━━━━━━━━━━━━━━━━━━━━━\n"
     "По всем вопросам: @aass11463"
 )
 
@@ -1215,6 +1503,95 @@ async def start_cmd(message: types.Message, state: FSMContext):
     # Убираем reply-клавиатуру (если была) и отправляем inline-меню
     await message.answer(text, reply_markup=types.ReplyKeyboardRemove(), parse_mode="HTML")
     await message.answer("🏠 <b>Главное меню</b>", reply_markup=get_main_inline_kb(), parse_mode="HTML")
+
+
+@dp.message(Command("oferta"))
+async def oferta_cmd(message: types.Message):
+    await message.answer("📜 <b>Публичная оферта Script AI</b>\n\n"
+                         "Самозанятый: Панферов Кирилл Алексеевич\n"
+                         "ИНН: 616810872170\n"
+                         "📩 kkpanferovvai@gmail.com | 💬 @aass11463", parse_mode="HTML")
+    try:
+        await message.answer_document(FSInputFile("oferta_scriptai.docx"), caption="Полный текст договора-оферты")
+    except Exception:
+        await message.answer(OFERTA_TEXT, parse_mode="HTML")
+
+
+@dp.message(Command("cancel"))
+
+@dp.callback_query(F.data == "tpl_back_dur")
+async def cb_tpl_back_dur(call: types.CallbackQuery, state: FSMContext):
+    """Возврат от выбора шаблона к длительности."""
+    cur = await state.get_state()
+    is_bulk = cur and "Bulk" in (cur or "")
+    await call.message.answer(
+        "⏱ <b>Укажи длительность сценария:</b>",
+        reply_markup=get_duration_inline_kb(), parse_mode="HTML"
+    )
+    await state.set_state(BulkMaker.waiting_for_duration if is_bulk else ScriptMaker.waiting_for_duration)
+    await call.answer()
+
+
+@dp.callback_query(F.data == "m_menu_cancel")
+async def cb_menu_cancel(call: types.CallbackQuery, state: FSMContext):
+    """«В меню» во время генерации — отменяет задачу."""
+    user_id = call.from_user.id
+    # Ищем активную задачу пользователя и отменяем
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT task_id FROM tasks WHERE user_id=$1 AND status='In Progress' ORDER BY created_at DESC LIMIT 1",
+            user_id
+        )
+    if row:
+        await update_task_status(row["task_id"], "Cancelled")
+        logging.info(f"Задача {row['task_id']} отменена через кнопку В меню")
+    await state.clear()
+    balance = await get_balance(user_id)
+    await show_menu(call, f"🏠 <b>Главное меню</b>\n💰 Баланс: <b>{balance:.1f} кред.</b>")
+
+
+@dp.callback_query(F.data.startswith("cancel_"))
+async def cancel_task_handler(call: types.CallbackQuery):
+    task_id = call.data.replace("cancel_", "")
+    await update_task_status(task_id, "Cancelled")
+    try:
+        await call.message.edit_text(
+            f"🛑 <b>Генерация отменена</b>\n\n🆔 ID: <code>{task_id}</code>",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+    await call.message.answer(
+        "Хочешь создать новый сценарий?",
+        reply_markup=get_after_gen_inline_kb(),
+    )
+    await call.answer()
+
+
+async def cancel_cmd(message: types.Message, state: FSMContext):
+    """Отменяет текущее FSM-состояние или активную генерацию."""
+    user_id = message.from_user.id
+    # Если идёт генерация — найти активную задачу и отменить
+    if user_id in _generating_users:
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT task_id FROM tasks WHERE user_id=$1 AND status='In Progress' ORDER BY created_at DESC LIMIT 1",
+                user_id
+            )
+        if row:
+            await update_task_status(row["task_id"], "Cancelled")
+            await message.answer(
+                f"🛑 <b>Генерация отменена</b>\n\n🆔 ID: <code>{row['task_id']}</code>",
+                reply_markup=get_after_gen_inline_kb(), parse_mode="HTML"
+            )
+            return
+    # Иначе — очищаем FSM состояние
+    cur = await state.get_state()
+    if cur:
+        await state.clear()
+        await message.answer("✅ Действие отменено.", reply_markup=get_main_inline_kb(), parse_mode="HTML")
+    else:
+        await message.answer("Нет активного действия для отмены.", reply_markup=get_main_inline_kb(), parse_mode="HTML")
 
 
 async def back_to_main(message_or_call, state: FSMContext = None):
@@ -1474,6 +1851,19 @@ async def back_to_main_msg(message: types.Message, state: FSMContext):
 # СОЗДАНИЕ СЦЕНАРИЯ — ВВОД ТЕМЫ
 # ---------------------------------------------------------------------------
 
+@dp.callback_query(F.data == "genre_back")
+async def cb_genre_back(call: types.CallbackQuery, state: FSMContext):
+    """Возврат к выбору жанра из описания."""
+    cur = await state.get_state()
+    is_bulk = cur and "Bulk" in cur
+    await call.message.edit_text(
+        "Выбери жанр сценария:",
+        reply_markup=get_style_inline_kb()
+    )
+    await state.set_state(BulkMaker.waiting_for_style if is_bulk else ScriptMaker.waiting_for_style)
+    await call.answer()
+
+
 @dp.callback_query(F.data == "m_create")
 async def cb_create(call: types.CallbackQuery, state: FSMContext):
     await state.clear()
@@ -1525,9 +1915,15 @@ async def process_topic(message: types.Message, state: FSMContext):
         f"\n\n✅ <i>Обнаружена фактура ({len(factual.split())} слов) — будет использована при генерации.</i>"
         if factual else ""
     )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎭 Художественный", callback_data="style_fiction")],
+        [InlineKeyboardButton(text="📰 Документальный", callback_data="style_documentary")],
+        [InlineKeyboardButton(text="🎓 Познавательный", callback_data="style_educational")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="m_menu")],
+    ])
     await message.answer(
         f"📌 Тема: <b>{topic[:100]}</b>{hint}\n\nВыбери жанр сценария:",
-        reply_markup=get_style_inline_kb(), parse_mode="HTML",
+        reply_markup=kb, parse_mode="HTML",
     )
     await state.set_state(ScriptMaker.waiting_for_style)
 
@@ -1597,8 +1993,24 @@ async def _after_style_cb(call: types.CallbackQuery, state: FSMContext, next_sta
     script_style = STYLE_CB_MAP.get(call.data, "documentary")
     await state.update_data(script_style=script_style)
     desc = STYLE_DESCRIPTIONS_CB.get(call.data, "")
-    text = f"{desc}\n\nУкажи длительность сценария:" if desc else "Укажи длительность:"
-    await call.message.answer(text, reply_markup=get_duration_inline_kb(), parse_mode="HTML")
+
+    # Показываем описание жанра редактируя текущее сообщение (убираем кнопки выбора)
+    if desc:
+        kb_back = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 Изменить жанр", callback_data="genre_back")],
+            [InlineKeyboardButton(text="🏠 В меню", callback_data="m_menu")],
+        ])
+        try:
+            await call.message.edit_text(desc, reply_markup=kb_back, parse_mode="HTML")
+        except Exception:
+            await call.message.answer(desc, reply_markup=kb_back, parse_mode="HTML")
+
+    # Отдельное сообщение с выбором длительности
+    await call.message.answer(
+        "⏱ <b>Укажи длительность сценария</b>\n\n"
+        "Рекомендуем брать на 10–15 мин больше нужного — темп у всех дикторов разный:",
+        reply_markup=get_duration_inline_kb(), parse_mode="HTML"
+    )
     await state.set_state(next_state)
     await call.answer()
 
@@ -1859,7 +2271,18 @@ async def _run_generation(message: types.Message, data: dict, style_prompt: str,
     _active_tasks += 1
 
     try:
-        temp_msg = await message.answer("⏳ <i>Подготовка структуры...</i>", parse_mode="HTML")
+        # Сразу показываем кнопку отмены — ещё до генерации плана
+        cancel_kb_early = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отменить", callback_data=f"cancel_{task_id}"),
+             InlineKeyboardButton(text="🏠 В меню",   callback_data="m_menu_cancel")]
+        ])
+        temp_msg = await message.answer(
+            f"⏳ <b>Подготовка структуры</b>\n\n"
+            f"🆔 ID: <code>{task_id}</code>\n"
+            f"🤖 Модель: <b>{friendly_model}</b>\n\n"
+            f"⚙️ <i>Генерируем мастер-документ и план...</i>",
+            reply_markup=cancel_kb_early, parse_mode="HTML"
+        )
 
         # ── МАСТЕР-ДОКУМЕНТ (синопсис) — генерируется ДО плана ─────────────
         target_chapters = max(1, round(words_target / WORDS_PER_CHAPTER))
@@ -1950,7 +2373,8 @@ async def _run_generation(message: types.Message, data: dict, style_prompt: str,
         total_chunks       = math.ceil(n / chunk_size)
 
         cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="❌ Отменить", callback_data=f"cancel_{task_id}")]
+            [InlineKeyboardButton(text="❌ Отменить", callback_data=f"cancel_{task_id}"),
+             InlineKeyboardButton(text="🏠 В меню",   callback_data="m_menu_cancel")]
         ])
         try:
             await temp_msg.delete()
@@ -1968,13 +2392,12 @@ async def _run_generation(message: types.Message, data: dict, style_prompt: str,
         def build_chapter_prompt(index, title, prev_text="", narrative_state="", mini_brief=""):
             # Для документального — мастер-документ только в первых главах,
             # дальше каждая глава работает со своим куском фактов из брифа.
-            # Это предотвращает повтор: модель не видит всю фактуру сразу.
             if script_style == "documentary" and index >= 3 and mini_brief:
                 lore_block = (
                     f"СПРАВОЧНИК ФАКТОВ (только для этой части, остальное уже использовано):\n"
                     f"{mini_brief}\n\n"
                 )
-                mini_brief_for_prompt = ""  # бриф уже вставлен в lore_block
+                mini_brief_for_prompt = ""
             else:
                 lore_block = (
                     f"╔══════════════════════════════════╗\n"
@@ -1987,23 +2410,30 @@ async def _run_generation(message: types.Message, data: dict, style_prompt: str,
                 ) if master_doc else ""
                 mini_brief_for_prompt = mini_brief
 
-            # Хвост предыдущей части — увеличен до 1500 символов
+            # Реестр имён — только для художественного жанра
+            # Предотвращает: разные персонажи с одним именем
+            name_registry_block = ""
+            if script_style == "fiction" and master_doc:
+                name_registry_block = (
+                    "РЕЕСТР ГЛАВНЫХ ПЕРСОНАЖЕЙ — их имена НЕЛЬЗЯ давать второстепенным:\n"
+                    "(извлечены из мастер-документа выше)\n"
+                    "Любой новый второстепенный персонаж должен называться иначе "
+                    "или оставаться без имени.\n\n"
+                )
+
             prev_block = (
                 f"ТАК ЗАКАНЧИВАЕТСЯ ПРЕДЫДУЩАЯ ЧАСТЬ — ПРОДОЛЖИ ОТСЮДА:\n"
                 f"«...{prev_text[-1500:]}»\n\n"
             ) if prev_text else ""
 
-            # Нарративный стейт — богатый контекст вместо голых фактов
             state_block = (
                 f"НАРРАТИВНАЯ ЭСТАФЕТА (что было до тебя):\n{narrative_state}\n\n"
             ) if narrative_state else ""
 
-            # Мини-бриф — конкретное задание для этой части
             brief_block = (
                 f"ТВОЁ ЗАДАНИЕ ДЛЯ ЭТОЙ ЧАСТИ:\n{mini_brief_for_prompt}\n\n"
             ) if mini_brief_for_prompt else ""
 
-            # Подсказка по позиции в структуре
             if index == 0:
                 position_hint = "Это ПЕРВАЯ часть — начни с сильного зацепляющего момента, без вступлений и приветствий."
             elif index == n - 1:
@@ -2011,7 +2441,6 @@ async def _run_generation(message: types.Message, data: dict, style_prompt: str,
             else:
                 position_hint = f"Это часть {index+1} из {n} — продолжай нарратив, не начинай заново."
 
-            # Жанровая инструкция
             genre_instructions = {
                 "fiction": (
                     "ЖАНР: художественный сценарий.\n"
@@ -2037,6 +2466,7 @@ async def _run_generation(message: types.Message, data: dict, style_prompt: str,
 
             return (
                 f"{lore_block}"
+                f"{name_registry_block}"
                 f"ПЛАН ВСЕГО СЦЕНАРИЯ ({n} частей):\n{full_plan_str}\n\n"
                 f"{prev_block}"
                 f"{state_block}"
@@ -2066,6 +2496,9 @@ async def _run_generation(message: types.Message, data: dict, style_prompt: str,
                     model_id, [{"role": "user", "content": prompt}], max_tokens_chapter,
                 )
                 clean = strip_cta_from_text(clean_chapter_text(raw))
+                # Layer 2: Проверка на обрыв предложения
+                clean = await complete_sentence(model_id, clean)
+                clean = clean.rstrip()
                 full_script_parts[index] = clean + "\n\n"
                 logging.info(f"[{task_id}] ✅ {index+1}/{n} — {len(clean.split())} слов")
             except Exception as e:
@@ -2075,7 +2508,7 @@ async def _run_generation(message: types.Message, data: dict, style_prompt: str,
         async def extract_narrative_state(text: str, chapter_index: int, chapter_title: str) -> str:
             """
             После каждой главы создаёт «нарративную эстафету» для следующего автора.
-            Для документального жанра — расширенный список использованных фактов.
+            Включает время/место — ключ к устранению противоречий типа «декабрь → апрель».
             """
             if not text or not text.strip():
                 return ""
@@ -2087,6 +2520,7 @@ async def _run_generation(message: types.Message, data: dict, style_prompt: str,
                     f"ХВОСТ ГЛАВЫ:\n{sample}\n\n"
                     f"Ответь СТРОГО в этом формате:\n"
                     f"ПОСЛЕДНЕЕ СОБЫТИЕ: [одно предложение — где остановились хронологически]\n"
+                    f"ВРЕМЕННОЙ КОНТЕКСТ: [точный период/дата/время суток когда закончилась эта глава]\n"
                     f"ПЕРИОД ЗАКРЫТ: [какой временной период или тема исчерпана — больше не возвращаться]\n"
                     f"ОТКРЫТЫЙ КРЮЧОК: [какой вопрос оставлен без ответа]\n"
                     f"ИСПОЛЬЗОВАННЫЕ ФАКТЫ — ЗАПРЕЩЕНО ПОВТОРЯТЬ:\n"
@@ -2100,6 +2534,7 @@ async def _run_generation(message: types.Message, data: dict, style_prompt: str,
                     f"ХВОСТ ГЛАВЫ:\n{sample}\n\n"
                     f"Ответь СТРОГО в этом формате (без лишних слов):\n"
                     f"ПОСЛЕДНЕЕ СОБЫТИЕ: [одно предложение — чем закончилась эта часть]\n"
+                    f"ВРЕМЕННОЙ КОНТЕКСТ: [когда и где происходит действие: время суток, сезон, место]\n"
                     f"ОТКРЫТЫЙ КРЮЧОК: [какой вопрос или напряжение оставлено без ответа]\n"
                     f"ЭМОЦИОНАЛЬНЫЙ ТОН: [одно слово: тревога/надежда/удивление/напряжение/грусть/триумф]\n"
                     f"АКТИВНЫЕ ЛИЦА: [кто последний раз упоминался]\n"
@@ -2109,71 +2544,68 @@ async def _run_generation(message: types.Message, data: dict, style_prompt: str,
                 return (await api_call_with_retry(
                     model_id,
                     [{"role": "user", "content": prompt_text}],
-                    500 if script_style == "documentary" else 350,
+                    600 if script_style == "documentary" else 450,
                 )).strip()
             except Exception:
                 return ""
 
         async def stitch_seams(parts: list[str]) -> list[str]:
             """
-            Для каждой пары соседних частей сглаживает стык:
-            берёт хвост части N и голову части N+1, просит модель переписать
-            их как единый фрагмент без разрыва. Все вызовы параллельны.
+            Сглаживает переходы между частями.
+            Вместо перезаписи больших блоков (что вызывало дубли) —
+            генерирует 1-3 мостиковых предложения между частями и вставляет их.
+            Оригинальный текст обеих частей не изменяется.
             """
             if len(parts) <= 1:
                 return parts
 
-            HALF = 250  # слов с каждой стороны стыка
+            TAIL_LEN = 400   # символов с конца части A
+            HEAD_LEN = 400   # символов с начала части B
             result = list(parts)
 
-            async def fix_seam(i: int):
-                words_a = result[i].split()
-                words_b = result[i + 1].split()
-                if len(words_a) < 60 or len(words_b) < 60:
+            async def bridge_seam(i: int):
+                part_a = result[i].rstrip()
+                part_b = result[i + 1].lstrip()
+                if len(part_a) < 100 or len(part_b) < 100:
                     return
-                tail_a = " ".join(words_a[-HALF:])
-                head_b = " ".join(words_b[:HALF])
+
+                tail_a = part_a[-TAIL_LEN:]
+                head_b = part_b[:HEAD_LEN]
+
+                # Проверяем нужен ли мост: если хвост A уже заканчивается хорошо
+                # и голова B продолжает плавно — пропускаем
+                tail_end = tail_a.rstrip()
+                if tail_end and tail_end[-1] not in '.!?»…':
+                    # Хвост A обрывается — нужна доводка
+                    pass
+                # В любом случае проверяем на резкий старт B
+
+                # Всегда создаём мост (дешевле чем проверять)
                 try:
-                    stitched = await api_call_with_retry(
+                    bridge = await api_call_with_retry(
                         model_id,
                         [{"role": "user", "content":
-                          f"Два фрагмента одного сценария идут подряд, но переход резкий.\n"
-                          f"Перепиши их как ЕДИНЫЙ плавный отрывок.\n"
-                          f"Сохрани все факты и события. Убери любые «начальные» фразы из второго фрагмента.\n"
-                          f"Объём — примерно такой же. Только текст, без комментариев.\n\n"
+                          f"Два фрагмента одного сценария идут подряд. "
+                          f"Напиши 1-2 коротких связующих предложения которые обеспечат плавный переход между ними. "
+                          f"Предложения должны органично вытекать из конца первого фрагмента и вести к началу второго. "
+                          f"НЕ повторяй текст из фрагментов. Только переход.\n\n"
                           f"КОНЕЦ ПЕРВОГО:\n«...{tail_a}»\n\n"
-                          f"НАЧАЛО ВТОРОГО:\n«{head_b}...»"}],
-                        min(HALF * 4, 3000),
+                          f"НАЧАЛО ВТОРОГО:\n«{head_b}...»\n\n"
+                          f"Верни только 1-2 связующих предложения."}],
+                        150,
                     )
-                    if not stitched or len(stitched.split()) < HALF * 0.6:
-                        return
-                    stitched_words = stitched.split()
-                    mid = len(stitched_words) // 2
-                    new_tail = " ".join(stitched_words[:mid])
-                    new_head = " ".join(stitched_words[mid:])
-
-                    # Дедупликация: убираем из new_head слова которые уже есть в new_tail
-                    tail_set = set(new_tail.lower().split()[-40:])
-                    head_words = new_head.split()
-                    # Пропускаем начало new_head пока оно дублирует конец new_tail (до 30 слов)
-                    skip = 0
-                    for w_idx in range(min(30, len(head_words))):
-                        window = " ".join(head_words[w_idx:w_idx + 8]).lower()
-                        if all(w in tail_set for w in window.split()[:4]):
-                            skip = w_idx + 1
-                    if skip:
-                        new_head = " ".join(head_words[skip:])
-
-                    result[i]     = " ".join(words_a[:-HALF]) + " " + new_tail
-                    result[i + 1] = new_head + " " + " ".join(words_b[HALF:])
-                    result[i]     = result[i].strip()
-                    result[i + 1] = result[i + 1].strip()
-                    logging.info(f"[{task_id}] 🔗 Стык {i+1}↔{i+2} сглажен (skip={skip})")
+                    if bridge and bridge.strip() and len(bridge.split()) < 60:
+                        bridge_clean = clean_chapter_text(bridge).strip()
+                        # Вставляем мост в конец части A (не меняя часть B)
+                        result[i] = part_a + " " + bridge_clean + "\n\n"
+                        logging.info(f"[{task_id}] 🔗 Мост {i+1}↔{i+2}: «{bridge_clean[:60]}...»")
                 except Exception as e:
-                    logging.warning(f"[{task_id}] Стык {i+1}: {e}")
+                    logging.warning(f"[{task_id}] Мост {i+1}: {e}")
 
-            await asyncio.gather(*[fix_seam(i) for i in range(len(result) - 1)])
-            return result
+            await asyncio.gather(*[bridge_seam(i) for i in range(len(result) - 1)])
+
+            # После всех мостов — чистим артефакты слипшихся слов
+            return [clean_chapter_text(p) if p else p for p in result]
 
         # ── МИНИ-БРИФЫ ─────────────────────────────────────────────────────
         await safe_edit(
@@ -2189,131 +2621,199 @@ async def _run_generation(message: types.Message, data: dict, style_prompt: str,
             model_id, chapters, master_doc, data['topic'], style_prompt, script_style, task_id
         )
 
-        # ── ГЕНЕРАЦИЯ ЧАСТЕЙ: якорь + цепочно-параллельная генерация ─────────
-        # Первые SEQ_ANCHOR глав — строго последовательно (закладывают мир).
-        # Остальные — параллельные цепочки по CHAIN_SIZE глав каждая.
-        # Внутри цепочки связность через prev_text, между цепочками — через
-        # общую сводку нарратива (narrative_summary).
+
+        # ── ВЫБОР РЕЖИМА ГЕНЕРАЦИИ ──────────────────────────────────────────
+        use_two_pass = n >= TWO_PASS_THRESHOLD
+        logging.info(f"[{task_id}] Режим: {'двухпроходной' if use_two_pass else 'однопроходной'} ({n} глав)")
+
         SEQ_ANCHOR = min(6, n)
         CHAIN_SIZE = 3
-
         done_count      = 0
         narrative_state = ""
 
-        # ── Фаза 1: якорные главы последовательно ──────────────────────────
-        for i in range(SEQ_ANCHOR):
-            if await get_task_status(task_id) == "Cancelled":
-                return
-            prev = full_script_parts[i - 1] if i > 0 else ""
-            await generate_one(
-                i, chapters[i],
-                prev_text=prev,
-                narrative_state=narrative_state,
-                mini_brief=mini_briefs[i] if i < len(mini_briefs) else "",
-            )
-            done_count += 1
+        if use_two_pass:
+            # ════════════════════════════════════════════════════════════════
+            # ДВУХПРОХОДНАЯ ГЕНЕРАЦИЯ
+            # Проход 1: скелет всех глав (быстро, последовательно)
+            # Проход 2: развёртка до полного объёма (каждая глава видит следующую)
+            # ════════════════════════════════════════════════════════════════
             await safe_edit(
                 status_msg,
-                build_progress_text(task_id, friendly_model, n, done_count,
-                                    max(0, n - done_count)),
+                f"⏳ <b>Генерация сценария</b>\n\n"
+                f"🆔 ID: <code>{task_id}</code>\n"
+                f"🤖 Модель: <b>{friendly_model}</b>\n\n"
+                f"[░░░░░░░░░░] 0%\n"
+                f"📋 <i>Проход 1: строим каркас сценария...</i>",
                 reply_markup=cancel_kb,
             )
-            new_state = await extract_narrative_state(
-                full_script_parts[i], i, chapters[i]
-            )
-            if new_state:
-                narrative_state = new_state
 
-        # ── Сводка нарратива после якоря — используется всеми цепочками ───
-        async def build_narrative_summary(parts_so_far: list[str]) -> str:
-            """Краткая сводка всего написанного — общий контекст для параллельных цепочек."""
-            combined = " ".join(p[-1500:] for p in parts_so_far if p)
-            if not combined.strip():
-                return narrative_state
-            try:
-                return (await api_call_with_retry(
-                    model_id,
-                    [{"role": "user", "content":
-                      f"Ты — сценарный редактор. Написана первая часть сценария.\n"
-                      f"Составь сводку для авторов следующих глав.\n\n"
-                      f"НАПИСАННОЕ:\n{combined[-4000:]}\n\n"
-                      f"Ответь в формате (до 300 слов):\n"
-                      f"ГДЕ МЫ: [текущая точка сюжета, 2-3 предложения]\n"
-                      f"ПЕРСОНАЖИ: [активные герои и их статус]\n"
-                      f"ОТКРЫТЫЕ ЛИНИИ: [что ещё не разрешено]\n"
-                      f"НЕЛЬЗЯ ПОВТОРЯТЬ: [5-7 фактов/фраз уже прозвучавших]\n"
-                      f"ТОН: [эмоциональный тон финала якорных глав]"}],
-                    600,
-                )).strip()
-            except Exception:
-                return narrative_state
-
-        # ── Фаза 2: параллельные цепочки ───────────────────────────────────
-        remaining = list(range(SEQ_ANCHOR, n))
-
-        if remaining:
-            narrative_summary = await build_narrative_summary(
-                full_script_parts[:SEQ_ANCHOR]
-            )
-
-            async def run_chain(chain_indices: list[int]):
-                """Одна цепочка: главы генерируются последовательно внутри цепочки."""
-                chain_narrative = narrative_summary  # общая сводка как стартовый контекст
-                for idx in chain_indices:
-                    if await get_task_status(task_id) == "Cancelled":
-                        return
-                    # prev_text — предыдущая глава ВНУТРИ цепочки, если есть
-                    chain_pos = chain_indices.index(idx)
-                    if chain_pos > 0:
-                        prev = full_script_parts[chain_indices[chain_pos - 1]]
-                    else:
-                        # Первая глава цепочки — берём хвост последней якорной главы
-                        prev = full_script_parts[SEQ_ANCHOR - 1] if SEQ_ANCHOR > 0 else ""
-                    await generate_one(
-                        idx, chapters[idx],
-                        prev_text=prev,
-                        narrative_state=chain_narrative,
-                        mini_brief=mini_briefs[idx] if idx < len(mini_briefs) else "",
-                    )
-                    # Обновляем нарратив внутри цепочки
-                    new_state = await extract_narrative_state(
-                        full_script_parts[idx], idx, chapters[idx]
-                    )
-                    if new_state:
-                        chain_narrative = new_state
-
-            # Разбиваем remaining на цепочки и запускаем параллельно батчами
-            PARALLEL_CHAINS = 3  # сколько цепочек идут одновременно
-            chain_idx = 0
-            while chain_idx < len(remaining):
+            # ── Проход 1: скелет ──────────────────────────────────────────
+            skeletons: list[str] = [""] * n
+            skel_narrative = ""
+            for i in range(n):
                 if await get_task_status(task_id) == "Cancelled":
                     return
-
-                # Нарезаем следующий батч цепочек
-                batch_chains = []
-                for _ in range(PARALLEL_CHAINS):
-                    start = chain_idx
-                    end   = min(start + CHAIN_SIZE, len(remaining))
-                    if start >= len(remaining):
-                        break
-                    batch_chains.append(remaining[start:end])
-                    chain_idx = end
-
-                await asyncio.gather(*[run_chain(c) for c in batch_chains])
-
-                done_count = sum(1 for p in full_script_parts if p)
+                skel = await generate_skeleton_chapter(
+                    model_id, i, chapters[i], n, full_plan_str,
+                    master_doc, style_prompt, script_style,
+                    prev_skeleton=skeletons[i-1] if i > 0 else "",
+                    narrative_state=skel_narrative,
+                )
+                skeletons[i] = skel
+                if skel:
+                    try:
+                        skel_narrative = (await api_call_with_retry(
+                            model_id,
+                            [{"role": "user", "content":
+                              f"Кратко (2-3 предложения): где мы в сюжете после этого фрагмента?\n"
+                              f"Время/место/персонажи/открытый вопрос.\n\n{skel[-500:]}"}],
+                            150,
+                        )).strip()
+                    except Exception:
+                        pass
+                pct = round(50 * (i + 1) / n)
+                bar = "▓" * (pct // 5) + "░" * (10 - pct // 5)
                 await safe_edit(
                     status_msg,
-                    build_progress_text(task_id, friendly_model, n, done_count,
-                                        max(0, n - done_count)),
+                    f"⏳ <b>Генерация сценария</b>\n\n"
+                    f"🆔 ID: <code>{task_id}</code>\n"
+                    f"🤖 Модель: <b>{friendly_model}</b>\n\n"
+                    f"[{bar}] {pct}%\n"
+                    f"📋 <i>Каркас: {i+1}/{n} частей...</i>",
                     reply_markup=cancel_kb,
                 )
+            logging.info(f"[{task_id}] ✅ Скелет готов: {sum(1 for s in skeletons if s)}/{n}")
 
-                # Обновляем общую сводку между батчами
-                if chain_idx < len(remaining):
-                    narrative_summary = await build_narrative_summary(
-                        [p for p in full_script_parts if p]
+            # ── Проход 2: развёртка ───────────────────────────────────────
+            await safe_edit(
+                status_msg,
+                f"⏳ <b>Генерация сценария</b>\n\n"
+                f"🆔 ID: <code>{task_id}</code>\n"
+                f"🤖 Модель: <b>{friendly_model}</b>\n\n"
+                f"[▓▓▓▓▓░░░░░] 50%\n"
+                f"✍️ <i>Проход 2: разворачиваем в полный текст...</i>",
+                reply_markup=cancel_kb,
+            )
+            exp_narrative = ""
+            for i in range(n):
+                if await get_task_status(task_id) == "Cancelled":
+                    return
+                expanded = await expand_chapter(
+                    model_id, i, chapters[i], n,
+                    skeleton=skeletons[i],
+                    full_plan_str=full_plan_str,
+                    master_doc=master_doc,
+                    style_prompt=style_prompt,
+                    script_style=script_style,
+                    prev_full=full_script_parts[i-1] if i > 0 else "",
+                    next_skeleton=skeletons[i+1] if i + 1 < n else "",
+                    narrative_state=exp_narrative,
+                    words_to_request=words_to_request,
+                    max_tokens=max_tokens_chapter,
+                )
+                if expanded:
+                    clean = await complete_sentence(model_id, expanded)
+                    full_script_parts[i] = clean.rstrip() + "\n\n"
+                done_count += 1
+                pct = 50 + round(50 * done_count / n)
+                bar = "▓" * (pct // 10) + "░" * (10 - pct // 10)
+                await safe_edit(
+                    status_msg,
+                    f"⏳ <b>Генерация сценария</b>\n\n"
+                    f"🆔 ID: <code>{task_id}</code>\n"
+                    f"🤖 Модель: <b>{friendly_model}</b>\n\n"
+                    f"[{bar}] {pct}%\n"
+                    f"✍️ <i>Развёртка: {done_count}/{n} частей...</i>",
+                    reply_markup=cancel_kb,
+                )
+                new_state = await extract_narrative_state(full_script_parts[i], i, chapters[i])
+                if new_state:
+                    exp_narrative = new_state
+
+        else:
+            # ════════════════════════════════════════════════════════════════
+            # ОДНОПРОХОДНАЯ ГЕНЕРАЦИЯ (якорь + параллельные цепочки)
+            # ════════════════════════════════════════════════════════════════
+            for i in range(SEQ_ANCHOR):
+                if await get_task_status(task_id) == "Cancelled":
+                    return
+                prev = full_script_parts[i - 1] if i > 0 else ""
+                await generate_one(
+                    i, chapters[i],
+                    prev_text=prev,
+                    narrative_state=narrative_state,
+                    mini_brief=mini_briefs[i] if i < len(mini_briefs) else "",
+                )
+                done_count += 1
+                await safe_edit(
+                    status_msg,
+                    build_progress_text(task_id, friendly_model, n, done_count, max(0, n - done_count)),
+                    reply_markup=cancel_kb,
+                )
+                new_state = await extract_narrative_state(full_script_parts[i], i, chapters[i])
+                if new_state:
+                    narrative_state = new_state
+
+            async def build_narrative_summary(parts_so_far: list[str]) -> str:
+                combined = " ".join(p[-1500:] for p in parts_so_far if p)
+                if not combined.strip():
+                    return narrative_state
+                try:
+                    return (await api_call_with_retry(
+                        model_id,
+                        [{"role": "user", "content":
+                          f"Составь сводку для авторов следующих глав (до 300 слов).\n"
+                          f"НАПИСАННОЕ:\n{combined[-4000:]}\n\n"
+                          f"ГДЕ МЫ / ВРЕМЕННОЙ КОНТЕКСТ / ПЕРСОНАЖИ / ОТКРЫТЫЕ ЛИНИИ / НЕЛЬЗЯ ПОВТОРЯТЬ / ТОН:"}],
+                        600,
+                    )).strip()
+                except Exception:
+                    return narrative_state
+
+            remaining = list(range(SEQ_ANCHOR, n))
+            if remaining:
+                narrative_summary = await build_narrative_summary(full_script_parts[:SEQ_ANCHOR])
+
+                async def run_chain(chain_indices: list[int]):
+                    chain_narrative = narrative_summary
+                    for idx in chain_indices:
+                        if await get_task_status(task_id) == "Cancelled":
+                            return
+                        chain_pos = chain_indices.index(idx)
+                        prev = full_script_parts[chain_indices[chain_pos-1]] if chain_pos > 0 else (full_script_parts[SEQ_ANCHOR-1] if SEQ_ANCHOR > 0 else "")
+                        await generate_one(
+                            idx, chapters[idx],
+                            prev_text=prev,
+                            narrative_state=chain_narrative,
+                            mini_brief=mini_briefs[idx] if idx < len(mini_briefs) else "",
+                        )
+                        new_state = await extract_narrative_state(full_script_parts[idx], idx, chapters[idx])
+                        if new_state:
+                            chain_narrative = new_state
+
+                PARALLEL_CHAINS = 3
+                chain_idx = 0
+                while chain_idx < len(remaining):
+                    if await get_task_status(task_id) == "Cancelled":
+                        return
+                    batch_chains = []
+                    for _ in range(PARALLEL_CHAINS):
+                        start = chain_idx
+                        end   = min(start + CHAIN_SIZE, len(remaining))
+                        if start >= len(remaining):
+                            break
+                        batch_chains.append(remaining[start:end])
+                        chain_idx = end
+                    await asyncio.gather(*[run_chain(c) for c in batch_chains])
+                    done_count = sum(1 for p in full_script_parts if p)
+                    await safe_edit(
+                        status_msg,
+                        build_progress_text(task_id, friendly_model, n, done_count, max(0, n - done_count)),
+                        reply_markup=cancel_kb,
                     )
+                    if chain_idx < len(remaining):
+                        narrative_summary = await build_narrative_summary([p for p in full_script_parts if p])
+
 
         if await get_task_status(task_id) == "Cancelled":
             return
@@ -2380,12 +2880,26 @@ async def _run_generation(message: types.Message, data: dict, style_prompt: str,
             f"⏳ <b>Генерация сценария</b>\n\n"
             f"🆔 ID: <code>{task_id}</code>\n"
             f"🤖 Модель: <b>{friendly_model}</b>\n\n"
-            f"[▓▓▓▓▓▓▓▓▓▓] 100%\n"
+            f"[▓▓▓▓▓▓▓▓▓░] 90%\n"
             f"✨ <i>Финальная полировка текста...</i>",
             reply_markup=None,
         )
         full_script = await polish_script(
             model_id, full_script, data['topic'], style_prompt, task_id
+        )
+
+        # ── ПРОВЕРКА КОНСИСТЕНТНОСТИ ─────────────────────────────────────────
+        await safe_edit(
+            status_msg,
+            f"⏳ <b>Генерация сценария</b>\n\n"
+            f"🆔 ID: <code>{task_id}</code>\n"
+            f"🤖 Модель: <b>{friendly_model}</b>\n\n"
+            f"[▓▓▓▓▓▓▓▓▓▓] 100%\n"
+            f"🔍 <i>Проверка логики и устранение повторов...</i>",
+            reply_markup=None,
+        )
+        full_script = await consistency_check_and_fix(
+            model_id, full_script, data['topic'], script_style, master_doc, task_id
         )
         word_count = len(full_script.split())
 
