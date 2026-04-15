@@ -433,8 +433,8 @@ async def api_call_with_retry(model_id: str, messages: list, max_tokens: int) ->
             # 402 — кончились кредиты OpenRouter, повторы бессмысленны
             if "402" in err_str or "require more credits" in err_str or "can only afford" in err_str:
                 raise APICreditsError(
-                    "На API-балансе OpenRouter недостаточно средств. "
-                    "Пополни баланс на openrouter.ai/settings/credits"
+                    "На API-балансе недостаточно средств для генерации. "
+                    "Обратитесь к администратору."
                 ) from e
             if any(x in err_str for x in ("rate", "429", "502", "503", "timeout")):
                 delay = API_RETRY_BASE_DELAY * (2 ** attempt)
@@ -1536,9 +1536,70 @@ async def oferta_cmd(message: types.Message):
         await message.answer(OFERTA_TEXT, parse_mode="HTML")
 
 
-@dp.message(Command("cancel"))
+@dp.message(Command("menu"))
+async def menu_cmd(message: types.Message, state: FSMContext):
+    await state.clear()
+    balance = await get_balance(message.from_user.id)
+    await message.answer(
+        f"🏠 <b>Главное меню</b>\n💰 Баланс: <b>{balance:.1f} кред.</b>",
+        reply_markup=get_main_inline_kb(), parse_mode="HTML"
+    )
 
-@dp.callback_query(F.data == "tpl_back_dur")
+
+@dp.message(Command("balance"))
+async def balance_cmd_slash(message: types.Message):
+    user_id = message.from_user.id
+    balance = await get_balance(user_id)
+    txs     = await get_transactions(user_id, limit=7)
+    user    = await get_or_create_user(user_id)
+    text = f"💰 <b>Баланс: {balance:.1f} кредитов</b>\n\n📋 <b>Последние операции:</b>\n"
+    for tx in txs:
+        sign = "+" if tx["amount"] > 0 else ""
+        text += f"  {sign}{tx['amount']:.1f} — {tx['description']} <i>({tx['created_at']})</i>\n"
+    if not txs:
+        text += "  <i>Операций нет</i>\n"
+    text += f"\n🔗 Реферальный код: <code>{user['referral_code']}</code>"
+    await message.answer(text, parse_mode="HTML")
+
+
+@dp.message(Command("help"))
+async def help_cmd(message: types.Message):
+    await message.answer(
+        "📖 <b>Доступные команды</b>\n\n"
+        "/start — перезапустить бота\n"
+        "/menu — главное меню\n"
+        "/balance — баланс и история операций\n"
+        "/cancel — отменить текущее действие или генерацию\n"
+        "/oferta — публичная оферта\n"
+        "/help — эта справка\n\n"
+        "По всем вопросам: @aass11463",
+        parse_mode="HTML"
+    )
+
+
+@dp.message(Command("cancel"))
+async def cancel_cmd(message: types.Message, state: FSMContext):
+    """Отменяет текущее FSM-состояние или активную генерацию."""
+    user_id = message.from_user.id
+    if user_id in _generating_users:
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT task_id FROM tasks WHERE user_id=$1 AND status='In Progress' ORDER BY created_at DESC LIMIT 1",
+                user_id
+            )
+        if row:
+            await update_task_status(row["task_id"], "Cancelled")
+            await message.answer(
+                f"🛑 <b>Генерация отменена</b>\n\n🆔 ID: <code>{row['task_id']}</code>",
+                reply_markup=get_after_gen_inline_kb(), parse_mode="HTML"
+            )
+            return
+    cur = await state.get_state()
+    if cur:
+        await state.clear()
+        await message.answer("✅ Действие отменено.", reply_markup=get_main_inline_kb(), parse_mode="HTML")
+    else:
+        await message.answer("Нет активного действия для отмены.", reply_markup=get_main_inline_kb(), parse_mode="HTML")
 async def cb_tpl_back_dur(call: types.CallbackQuery, state: FSMContext):
     """Возврат от выбора шаблона к длительности."""
     cur = await state.get_state()
@@ -1586,31 +1647,6 @@ async def cancel_task_handler(call: types.CallbackQuery):
     )
     await call.answer()
 
-
-async def cancel_cmd(message: types.Message, state: FSMContext):
-    """Отменяет текущее FSM-состояние или активную генерацию."""
-    user_id = message.from_user.id
-    # Если идёт генерация — найти активную задачу и отменить
-    if user_id in _generating_users:
-        async with db_pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT task_id FROM tasks WHERE user_id=$1 AND status='In Progress' ORDER BY created_at DESC LIMIT 1",
-                user_id
-            )
-        if row:
-            await update_task_status(row["task_id"], "Cancelled")
-            await message.answer(
-                f"🛑 <b>Генерация отменена</b>\n\n🆔 ID: <code>{row['task_id']}</code>",
-                reply_markup=get_after_gen_inline_kb(), parse_mode="HTML"
-            )
-            return
-    # Иначе — очищаем FSM состояние
-    cur = await state.get_state()
-    if cur:
-        await state.clear()
-        await message.answer("✅ Действие отменено.", reply_markup=get_main_inline_kb(), parse_mode="HTML")
-    else:
-        await message.answer("Нет активного действия для отмены.", reply_markup=get_main_inline_kb(), parse_mode="HTML")
 
 
 async def back_to_main(message_or_call, state: FSMContext = None):
@@ -2980,10 +3016,9 @@ async def _run_generation(message: types.Message, data: dict, style_prompt: str,
         logging.error(f"[{task_id}] ❌ Кончились кредиты OpenRouter: {e}")
         try:
             await message.answer(
-                f"⚠️ <b>Генерация остановлена</b>\n\n"
-                f"На API-балансе закончились средства.\n"
-                f"Администратору нужно пополнить баланс на "
-                f"<a href='https://openrouter.ai/settings/credits'>openrouter.ai</a>\n\n"
+                f"⚠️ <b>Генерация временно недоступна</b>\n\n"
+                f"Технические работы на стороне сервиса. "
+                f"Попробуй позже или обратись к администратору: @aass11463\n\n"
                 f"🆔 ID задачи: <code>{task_id}</code>\n"
                 f"<i>Твои кредиты НЕ списаны.</i>",
                 parse_mode="HTML",
