@@ -446,6 +446,9 @@ async def api_call_with_retry(model_id: str, messages: list, max_tokens: int) ->
 
 
 def clean_chapter_text(text: str) -> str:
+    # Убираем HTML-комментарии и теги (артефакты модели)
+    text = re.sub(r'<!--.*?-->', '', text, flags=re.DOTALL)
+    text = re.sub(r'<[^>]{1,60}>', '', text)
     text = re.sub(r'^[-*_=~]{3,}\s*$', '', text, flags=re.MULTILINE)
     text = re.sub(r'^#{1,6}[\s#].*$', '', text, flags=re.MULTILINE)   # # комментарии модели
     text = re.sub(r'^#\s*[А-ЯЁA-Z][^\n]{0,80}$', '', text, flags=re.MULTILINE)  # # Единый отрывок и т.п.
@@ -844,31 +847,38 @@ async def generate_skeleton_chapter(
 ) -> str:
     """
     Первый проход: генерирует краткий скелет главы (~150-200 слов).
-    Только ключевые события, без развёрнутых описаний.
+    Использует system prompt для лора — модель жёстче соблюдает факты.
     """
-    lore_block = f"МАСТЕР-ДОКУМЕНТ:\n{master_doc}\n\n" if master_doc else ""
-    prev_block = f"ПРЕДЫДУЩАЯ ГЛАВА (кратко):\n«...{prev_skeleton[-600:]}»\n\n" if prev_skeleton else ""
-    state_block = f"НАРРАТИВНЫЙ КОНТЕКСТ:\n{narrative_state}\n\n" if narrative_state else ""
-
     genre_map = {
         "fiction":     "художественный — только ключевые события и диалоги",
         "documentary": "документальный — только ключевые факты и даты",
         "educational": "познавательный — только главный тезис и один пример",
     }
 
-    prompt = (
-        f"{lore_block}"
-        f"ПЛАН СЦЕНАРИЯ ({n} частей):\n{full_plan_str}\n\n"
-        f"{prev_block}{state_block}"
-        f"ЗАДАЧА: напиши КРАТКИЙ СКЕЛЕТ части №{index+1} — «{title}»\n"
-        f"Жанр: {genre_map.get(script_style, 'сценарий')}\n"
-        f"Объём: ровно 150-200 слов. Только ключевые события/факты — без развёрнутых описаний.\n"
-        f"Это черновик для дальнейшего развёртывания, не финальный текст.\n"
-        f"Стиль: {style_prompt[:100]}\n\n"
-        f"Только текст, без заголовков и пояснений."
-    )
+    system_content = "\n\n".join(filter(None, [
+        f"МАСТЕР-ДОКУМЕНТ:\n{master_doc}" if master_doc else "",
+        f"ЖАНР: {genre_map.get(script_style, 'сценарий')}",
+        f"ПЛАН СЦЕНАРИЯ ({n} частей):\n{full_plan_str}",
+        f"СТИЛЬ: {style_prompt[:100]}",
+        "Пиши только текст, без заголовков и пояснений.",
+    ]))
+
+    messages: list[dict] = [{"role": "system", "content": system_content}]
+
+    # Fake history для скелетов
+    if prev_skeleton and index > 0:
+        ctx = f"Нарративный контекст:\n{narrative_state}" if narrative_state else "Продолжаем."
+        messages.append({"role": "user", "content": ctx})
+        messages.append({"role": "assistant", "content": f"...{prev_skeleton[-400:]}"})
+
+    messages.append({"role": "user", "content": (
+        f"Напиши КРАТКИЙ СКЕЛЕТ части №{index+1} — «{title}».\n"
+        f"Объём: ровно 150-200 слов. Только ключевые события/факты, без развёрнутых описаний.\n"
+        f"Это черновик для дальнейшего развёртывания."
+    )})
+
     try:
-        raw = await api_call_with_retry(model_id, [{"role": "user", "content": prompt}], 600)
+        raw = await api_call_with_retry(model_id, messages, 600)
         return clean_chapter_text(raw).strip() if raw else ""
     except APICreditsError:
         raise
@@ -887,27 +897,12 @@ async def expand_chapter(
 ) -> str:
     """
     Второй проход: разворачивает скелет главы до полного объёма.
-    Ключевое отличие от обычной генерации: глава видит не только предыдущую,
-    но и скелет СЛЕДУЮЩЕЙ части — и знает куда она ведёт.
+    Использует system/user/assistant архитектуру:
+    - system: лор, жанр, глобальные правила
+    - assistant: хвост предыдущей главы (fake history)
+    - user: задание с скелетом и указателем на следующую часть
     """
-    lore_block = (
-        f"╔══════════════════════════════════╗\n"
-        f"║         МАСТЕР-ДОКУМЕНТ          ║\n"
-        f"╚══════════════════════════════════╝\n"
-        f"{master_doc}\n\n"
-    ) if master_doc else ""
-
-    prev_block = (
-        f"ТАК ЗАКАНЧИВАЕТСЯ ПРЕДЫДУЩАЯ ЧАСТЬ (продолжи отсюда):\n«...{prev_full[-1500:]}»\n\n"
-    ) if prev_full else ""
-
-    next_block = (
-        f"ТАК НАЧНЁТСЯ СЛЕДУЮЩАЯ ЧАСТЬ (закончи так, чтобы туда было логично перейти):\n«{next_skeleton[:400]}...»\n\n"
-    ) if next_skeleton else ""
-
-    state_block = f"НАРРАТИВНАЯ ЭСТАФЕТА:\n{narrative_state}\n\n" if narrative_state else ""
-
-    genre_instructions = {
+    genre_rules = {
         "fiction": (
             "ЖАНР: художественный. Пиши через персонажей: действия, диалоги, внутренние монологи. "
             "Эмоции — через детали и поступки, не через прямые описания."
@@ -922,33 +917,54 @@ async def expand_chapter(
         ),
     }.get(script_style, "")
 
-    if index == 0:
-        position = "ПЕРВАЯ часть — начни с сильного зацепляющего момента, без вступлений."
-    elif index == n - 1:
-        position = "ПОСЛЕДНЯЯ часть — дай ощущение завершённости."
-    else:
-        position = f"Часть {index+1} из {n} — продолжай нарратив, не начинай заново."
+    lore_section = (
+        f"МАСТЕР-ДОКУМЕНТ — используй ТОЛЬКО эти имена и факты:\n{master_doc}\n"
+    ) if master_doc else ""
 
-    prompt = (
-        f"{lore_block}"
-        f"ПЛАН СЦЕНАРИЯ ({n} частей):\n{full_plan_str}\n\n"
-        f"{prev_block}{state_block}"
-        f"СКЕЛЕТ ТЕКУЩЕЙ ЧАСТИ (разверни его до полного объёма):\n{skeleton}\n\n"
-        f"{next_block}"
-        f"{genre_instructions}\n\n"
-        f"СЕЙЧАС ПИШЕШЬ: часть №{index+1} — «{title}»\n"
+    system_content = "\n\n".join(filter(None, [
+        lore_section,
+        genre_rules,
+        (f"СТИЛЬ: {style_prompt}\n"
+         f"ФОРМАТ: сплошной текст без заголовков, списков, символов #*-.\n"
+         f"ЗАПРЕЩЕНО: вступления, подведение итогов, призывы к зрителям, HTML-теги.\n"
+         f"Это фрагмент единого повествования из {n} частей."),
+        f"ПЛАН СЦЕНАРИЯ ({n} частей):\n{full_plan_str}",
+    ]))
+
+    messages: list[dict] = [{"role": "system", "content": system_content}]
+
+    # Fake history: хвост предыдущей главы — в уста модели
+    if prev_full and index > 0:
+        tail = prev_full[-1500:].strip()
+        ctx = f"Нарративный контекст:\n{narrative_state}" if narrative_state else "Продолжаем с того места где остановились."
+        messages.append({"role": "user", "content": ctx})
+        messages.append({"role": "assistant", "content": f"...{tail}"})
+
+    # User: задание для текущей главы
+    if index == 0:
+        position = "Это ПЕРВАЯ часть — начни с сильного зацепляющего момента, без вступлений."
+    elif index == n - 1:
+        position = "Это ПОСЛЕДНЯЯ часть — дай ощущение завершённости."
+    else:
+        position = f"Часть {index+1} из {n} — продолжай нарратив органично."
+
+    next_hint = (
+        f"\nТАК НАЧНЁТСЯ СЛЕДУЮЩАЯ ЧАСТЬ — закончи так, чтобы к ней был логичный переход:\n"
+        f"«{next_skeleton[:400]}...»"
+    ) if next_skeleton else ""
+
+    user_content = (
+        f"Разверни этот скелет в полноценный текст части №{index+1} — «{title}».\n"
         f"{position}\n\n"
-        f"ПРАВИЛО: это фрагмент единого сплошного повествования. "
-        f"Не начинай с нуля. Не делай вводных фраз типа «Сегодня мы поговорим». "
-        f"В конце оборви на крючке — не подводи итог.\n\n"
-        f"СТИЛЬ: {style_prompt}\n\n"
-        f"ТЕХНИЧЕСКИЕ ТРЕБОВАНИЯ:\n"
-        f"1. Объём: ровно {words_to_request} слов.\n"
-        f"2. Формат: сплошной текст без заголовков, списков, символов #*-.\n"
-        f"3. ЗАПРЕЩЕНО: вступления, итоги, призывы к зрителям."
+        f"СКЕЛЕТ:\n{skeleton}\n"
+        f"{next_hint}\n\n"
+        f"В конце оборви на крючке — не подводи итог.\n"
+        f"Объём: ровно {words_to_request} слов."
     )
+    messages.append({"role": "user", "content": user_content})
+
     try:
-        raw = await api_call_with_retry(model_id, [{"role": "user", "content": prompt}], max_tokens)
+        raw = await api_call_with_retry(model_id, messages, max_tokens)
         return strip_cta_from_text(clean_chapter_text(raw)).strip() if raw else ""
     except APICreditsError:
         raise
@@ -2419,8 +2435,9 @@ async def _run_generation(message: types.Message, data: dict, style_prompt: str,
         words_to_request   = max(50, int(words_per_chapter * overrequest_factor))
         max_tokens_chapter = min(int(words_to_request * 2.4), 4096)
         # CTA только если пользователь явно упомянул это в шаблоне
-        _cta_keywords = ("cta", "комментар", "призыв", "подписк", "лайк",
-                         "вопрос к зрител", "байт", "одно слово", "комментари")
+        _cta_keywords = ("cta", "призыв", "подписк", "лайк",
+                         "вопрос к зрител", "байт",
+                         "напиши в комментарии", "поставь лайк")
         _user_wants_cta = any(kw in style_prompt.lower() for kw in _cta_keywords)
         cta_positions  = compute_cta_positions(n) if _user_wants_cta else set()
         full_plan_str      = "\n".join(f"{i+1}. {t}" for i, t in enumerate(chapters))
@@ -2444,120 +2461,117 @@ async def _run_generation(message: types.Message, data: dict, style_prompt: str,
         # ── ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ГЕНЕРАЦИИ ──────────────────────────────
         full_script_parts: list[str] = [""] * n
 
-        def build_chapter_prompt(index, title, prev_text="", narrative_state="", mini_brief=""):
-            # Для документального — мастер-документ только в первых главах,
-            # дальше каждая глава работает со своим куском фактов из брифа.
+        def build_chapter_messages(index, title, prev_text="", narrative_state="", mini_brief="") -> list[dict]:
+            """
+            Возвращает массив messages для api_call_with_retry.
+            Архитектура: system (лор + правила) + fake history (prev_text в роли assistant)
+            + user (задание для текущей главы).
+            Это заставляет модель воспринимать хвост предыдущей главы как свой собственный текст
+            и органично продолжать, а не «начинать заново».
+            """
+
+            # ── SYSTEM: лор, имена, жанровые правила ──────────────────────
             if script_style == "documentary" and index >= 3 and mini_brief:
-                lore_block = (
+                lore_section = (
                     f"СПРАВОЧНИК ФАКТОВ (только для этой части, остальное уже использовано):\n"
-                    f"{mini_brief}\n\n"
+                    f"{mini_brief}\n"
                 )
-                mini_brief_for_prompt = ""
             else:
-                lore_block = (
-                    f"╔══════════════════════════════════╗\n"
-                    f"║         МАСТЕР-ДОКУМЕНТ          ║\n"
-                    f"║  Используй ТОЛЬКО эти имена и    ║\n"
-                    f"║  факты. Ничего не придумывай.    ║\n"
-                    f"╚══════════════════════════════════╝\n"
+                lore_section = (
+                    f"МАСТЕР-ДОКУМЕНТ — используй ТОЛЬКО эти имена и факты, ничего не придумывай:\n"
                     f"{master_doc}\n"
-                    f"════════════════════════════════════\n\n"
                 ) if master_doc else ""
-                mini_brief_for_prompt = mini_brief
 
-            # Реестр имён — только для художественного жанра
-            # Предотвращает: разные персонажи с одним именем
-            name_registry_block = ""
+            name_registry = ""
             if script_style == "fiction" and master_doc:
-                name_registry_block = (
-                    "РЕЕСТР ГЛАВНЫХ ПЕРСОНАЖЕЙ — их имена НЕЛЬЗЯ давать второстепенным:\n"
-                    "(извлечены из мастер-документа выше)\n"
-                    "Любой новый второстепенный персонаж должен называться иначе "
-                    "или оставаться без имени.\n\n"
+                name_registry = (
+                    "РЕЕСТР ГЛАВНЫХ ПЕРСОНАЖЕЙ — их имена НЕЛЬЗЯ давать второстепенным.\n"
+                    "Любой новый второстепенный персонаж должен называться иначе или оставаться без имени.\n"
                 )
 
-            prev_block = (
-                f"ТАК ЗАКАНЧИВАЕТСЯ ПРЕДЫДУЩАЯ ЧАСТЬ — ПРОДОЛЖИ ОТСЮДА:\n"
-                f"«...{prev_text[-1500:]}»\n\n"
-            ) if prev_text else ""
-
-            state_block = (
-                f"НАРРАТИВНАЯ ЭСТАФЕТА (что было до тебя):\n{narrative_state}\n\n"
-            ) if narrative_state else ""
-
-            brief_block = (
-                f"ТВОЁ ЗАДАНИЕ ДЛЯ ЭТОЙ ЧАСТИ:\n{mini_brief_for_prompt}\n\n"
-            ) if mini_brief_for_prompt else ""
-
-            if index == 0:
-                position_hint = "Это ПЕРВАЯ часть — начни с сильного зацепляющего момента, без вступлений и приветствий."
-            elif index == n - 1:
-                position_hint = "Это ПОСЛЕДНЯЯ часть — подведи к финальному выводу, дай ощущение завершённости истории."
-            else:
-                position_hint = f"Это часть {index+1} из {n} — продолжай нарратив, не начинай заново."
-
-            genre_instructions = {
+            genre_rules = {
                 "fiction": (
                     "ЖАНР: художественный сценарий.\n"
-                    "Пиши через персонажей: их действия, диалоги, внутренние монологи. "
-                    "Покажи эмоции через детали и поступки, а не через прямые описания чувств. "
+                    "Пиши через персонажей: действия, диалоги, внутренние монологи. "
+                    "Эмоции — через детали и поступки, а не прямые описания. "
                     "Каждая сцена должна менять ситуацию или характер героя."
                 ),
                 "documentary": (
                     "ЖАНР: документальный сценарий.\n"
-                    "Пиши от лица рассказчика: факты, даты, реальные события. "
-                    "Ничего не придумывай. Если факт неизвестен — так и говори. "
+                    "Только реальные факты. Ничего не придумывай. "
                     "Используй только имена и даты из мастер-документа."
                 ),
                 "educational": (
                     "ЖАНР: познавательный сценарий.\n"
-                    "Объясняй через аналогии, примеры и вопросы к зрителю. "
-                    "Веди от простого к сложному. Каждый абзац должен добавлять одно новое понимание. "
-                    "Избегай жаргона — объясняй так, как объяснял бы умному другу без специального образования."
+                    "Объясняй через аналогии и примеры. "
+                    "Веди от простого к сложному. Каждый абзац — одно новое понимание."
                 ),
             }.get(script_style, "")
 
-            genre_block = f"{genre_instructions}\n\n" if genre_instructions else ""
-
-            return (
-                f"{lore_block}"
-                f"{name_registry_block}"
-                f"ПЛАН ВСЕГО СЦЕНАРИЯ ({n} частей):\n{full_plan_str}\n\n"
-                f"{prev_block}"
-                f"{state_block}"
-                f"{brief_block}"
-                f"{genre_block}"
-                f"СЕЙЧАС ПИШЕШЬ: часть №{index+1} из {n} — «{title}»\n"
-                f"{position_hint}\n\n"
-                f"ГЛАВНОЕ ПРАВИЛО: этот текст — фрагмент единого сплошного повествования. "
-                f"Не начинай с нуля. Не делай вводных предложений типа «Сегодня мы поговорим», "
-                f"«В этом видео», «Привет». Продолжай историю там, где она прервалась. "
-                f"В конце оборви на крючке из брифа — не подводи итог.\n\n"
-                f"СТИЛЬ: {style_prompt}\n\n"
-                f"ТЕХНИЧЕСКИЕ ТРЕБОВАНИЯ:\n"
-                f"1. Объём: ровно {words_to_request} слов.\n"
-                f"2. Формат: сплошной текст без заголовков, списков, символов #*-.\n"
-                f"3. ЗАПРЕЩЕНО: вступления, подведение итогов, призывы к зрителям, "
-                f"повтор фактов из нарративной эстафеты."
+            global_rules = (
+                "ГЛОБАЛЬНЫЕ ПРАВИЛА:\n"
+                f"- Стиль: {style_prompt}\n"
+                f"- Формат: сплошной текст без заголовков, списков, символов #*-.\n"
+                f"- ЗАПРЕЩЕНО: вступления («Сегодня мы поговорим», «В этом видео», «Привет»), "
+                f"подведение итогов, призывы к зрителям, HTML-теги, технические пометки.\n"
+                f"- Это фрагмент единого повествования из {n} частей. "
+                f"Продолжай там где остановился, не начинай заново."
             )
+
+            system_content = "\n\n".join(filter(None, [
+                lore_section, name_registry, genre_rules, global_rules,
+                f"ПЛАН СЦЕНАРИЯ ({n} частей):\n{full_plan_str}",
+            ]))
+
+            messages = [{"role": "system", "content": system_content}]
+
+            # ── FAKE HISTORY: передаём хвост предыдущей главы как assistant ──
+            if prev_text and index > 0:
+                tail = prev_text[-1500:].strip()
+                # Контекстное сообщение от user — «что мы уже знаем»
+                context_user = f"Нарративный контекст (где мы в сюжете):\n{narrative_state}" if narrative_state else \
+                               "Продолжаем с того места где остановились."
+                messages.append({"role": "user", "content": context_user})
+                # Хвост предыдущей главы — в уста модели (она «поверит», что сама написала)
+                messages.append({"role": "assistant", "content": f"...{tail}"})
+
+            # ── USER: задание для текущей главы ───────────────────────────
+            if index == 0:
+                position_hint = "Это ПЕРВАЯ часть — начни с сильного зацепляющего момента, без вступлений."
+            elif index == n - 1:
+                position_hint = "Это ПОСЛЕДНЯЯ часть — подведи к финальному выводу, дай ощущение завершённости."
+            else:
+                position_hint = f"Это часть {index+1} из {n} — продолжай нарратив органично."
+
+            brief_line = f"Твоё задание для этой части:\n{mini_brief}\n\n" if (mini_brief and script_style != "documentary") else ""
+            # Для documentary >= 4 бриф уже в system (lore_section), не дублируем
+
+            user_content = (
+                f"{brief_line}"
+                f"Напиши часть №{index+1} из {n} — «{title}».\n"
+                f"{position_hint}\n\n"
+                f"В конце оборви на крючке — не подводи итог.\n"
+                f"Объём: ровно {words_to_request} слов."
+            )
+            messages.append({"role": "user", "content": user_content})
+
+            return messages
 
         async def generate_one(index, title, prev_text="", narrative_state="",
                                mini_brief="", is_regen=False):
             if await get_task_status(task_id) == "Cancelled":
                 return
-            prompt = build_chapter_prompt(index, title, prev_text, narrative_state, mini_brief)
+            messages = build_chapter_messages(index, title, prev_text, narrative_state, mini_brief)
             try:
-                raw   = await api_call_with_retry(
-                    model_id, [{"role": "user", "content": prompt}], max_tokens_chapter,
-                )
+                raw   = await api_call_with_retry(model_id, messages, max_tokens_chapter)
                 clean = strip_cta_from_text(clean_chapter_text(raw))
-                # Layer 2: Проверка на обрыв предложения
+                # Проверка на обрыв предложения
                 clean = await complete_sentence(model_id, clean)
                 clean = clean.rstrip()
                 full_script_parts[index] = clean + "\n\n"
                 logging.info(f"[{task_id}] ✅ {index+1}/{n} — {len(clean.split())} слов")
             except APICreditsError:
-                raise  # пробрасываем наверх — останавливаем всю генерацию
+                raise
             except Exception as e:
                 logging.error(f"[{task_id}] ❌ {index+1}: {e}")
                 full_script_parts[index] = ""
